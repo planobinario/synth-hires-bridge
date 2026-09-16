@@ -72,13 +72,32 @@ jobs:
           name: ${{ matrix.artifact }}
           path: apps/desktop-daemon/${{ matrix.artifact }}
 
+  nix-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Check & build with Nix Flake
+        run: nix build -L
+      - name: Stage Nix binary
+        run: |
+          mkdir -p nix_out
+          cp -L result/bin/synthhires-bridge nix_out/synthhires-bridge-nixos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: synthhires-bridge-nixos
+          path: nix_out/synthhires-bridge-nixos
+
   # Tagged releases (v*): attach every platform binary to a GitHub Release
   # named after the tag, so `releases/download/vX.Y.Z/<asset>` actually
   # resolves. Without this job the tag build only produced CI artifacts.
   # The continuously-updated `edge` release (see ci.yml) stays the default
   # the web serves; this job is for pinned/stable downloads.
   release:
-    needs: desktop
+    needs: [desktop, nix-build]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -95,6 +114,9 @@ jobs:
           cp artifacts/synthhires-bridge-linux-arm64/synthhires-bridge-linux-arm64 release_assets/
           cp artifacts/synthhires-bridge-macos-x64/synthhires-bridge-macos-x64 release_assets/synthhires-bridge-macos
           cp artifacts/synthhires-bridge-macos-arm64/synthhires-bridge-macos-arm64 release_assets/
+          if [ -f artifacts/synthhires-bridge-nixos/synthhires-bridge-nixos ]; then
+            cp artifacts/synthhires-bridge-nixos/synthhires-bridge-nixos release_assets/synthhires-bridge-nixos
+          fi
       - name: Create or update release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

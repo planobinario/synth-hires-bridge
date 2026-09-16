@@ -5,10 +5,12 @@ on:
     paths:
       - 'apps/desktop-daemon/**'
       - '.github/workflows/**'
+      - 'flake.nix'
   pull_request:
     paths:
       - 'apps/desktop-daemon/**'
       - '.github/workflows/**'
+      - 'flake.nix'
 
 jobs:
   build:
@@ -32,6 +34,25 @@ jobs:
         run: cargo build --release --bin synthhires-bridge
       - name: cargo test
         run: cargo test
+
+  nix-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Check & build with Nix Flake
+        run: nix build -L
+      - name: Stage Nix binary
+        run: |
+          mkdir -p nix_out
+          cp -L result/bin/synthhires-bridge nix_out/synthhires-bridge-nixos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: synthhires-bridge-nixos
+          path: nix_out/synthhires-bridge-nixos
 
   build-release:
     needs: build
@@ -62,7 +83,7 @@ jobs:
           path: apps/desktop-daemon/target/release/${{ matrix.artifact }}
 
   publish-release:
-    needs: build-release
+    needs: [build-release, nix-build]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
@@ -78,6 +99,9 @@ jobs:
           cp artifacts/synthhires-bridge-windows-latest/synthhires-bridge.exe release_assets/synthhires-bridge-windows.exe
           cp artifacts/synthhires-bridge-macos-latest/synthhires-bridge release_assets/synthhires-bridge-macos
           cp artifacts/synthhires-bridge-ubuntu-latest/synthhires-bridge release_assets/synthhires-bridge-linux
+          if [ -f artifacts/synthhires-bridge-nixos/synthhires-bridge-nixos ]; then
+            cp artifacts/synthhires-bridge-nixos/synthhires-bridge-nixos release_assets/synthhires-bridge-nixos
+          fi
       - name: Publish Edge Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -87,3 +111,4 @@ jobs:
           
           # Overwrite the assets with the new ones
           gh release upload edge release_assets/* --clobber
+

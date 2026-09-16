@@ -39,10 +39,17 @@ La web espera estos nombres en el release `edge`:
 - `synthhires-bridge-windows.exe`
 - `synthhires-bridge-linux`
 - `synthhires-bridge-macos`
+- `synthhires-bridge-nixos`
 
-Los releases versionados (`vX.Y.Z`) añaden las variantes de arquitectura:
-`-x64` / `-arm64` (linux y macos). No renombrar los assets del release
+Los releases versionados (`v*`) añaden las variantes de arquitectura:
+`-x64` / `-arm64` (linux y macos) y `synthhires-bridge-nixos`. No renombrar los assets del release
 `edge`: la URL de descarga de la web los referencia directamente.
+
+### Soporte NixOS / Nix Flakes
+El repo incluye `flake.nix` en la raíz. Puede ejecutarse directamente vía:
+`nix run github:planobinario/synth-hires-bridge`
+o añadirse como módulo systemd en NixOS (`services.synthhires-bridge.enable = true;`).
+El CI compila el Flake y publica el binario empaquetado `synthhires-bridge-nixos`.
 
 ## Seguimiento del build
 
