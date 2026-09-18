@@ -104,16 +104,36 @@ enum Cmd {
     Stop,
 }
 
+/// Default state directory. User builds keep per-user config (ProjectDirs);
+/// system builds (`--features system-install`) use a shared, root-manageable
+/// path, overridable via SYNTHHIRES_CONFIG_DIR for non-standard deployments.
+fn default_config_dir() -> PathBuf {
+    #[cfg(feature = "system-install")]
+    {
+        if let Ok(dir) = std::env::var("SYNTHHIRES_CONFIG_DIR") {
+            if !dir.is_empty() {
+                return PathBuf::from(dir);
+            }
+        }
+        #[cfg(target_os = "windows")]
+        return std::env::var("ProgramData")
+            .map(|d| PathBuf::from(d).join("SynthHires").join("Bridge"))
+            .unwrap_or_else(|_| PathBuf::from("C:\\ProgramData\\SynthHires\\Bridge"));
+        #[cfg(not(target_os = "windows"))]
+        return PathBuf::from("/var/lib/synthhires-bridge");
+    }
+    #[cfg(not(feature = "system-install"))]
+    directories::ProjectDirs::from("com", "synthhires", "bridge")
+        .map(|d| d.config_dir().to_path_buf())
+        .unwrap_or_else(|| {
+            dirs_next::data_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("synthhires-bridge")
+        })
+}
+
 fn config_dir_of(cli: &Cli) -> PathBuf {
-    cli.config_dir.clone().unwrap_or_else(|| {
-        directories::ProjectDirs::from("com", "synthhires", "bridge")
-            .map(|d| d.config_dir().to_path_buf())
-            .unwrap_or_else(|| {
-                dirs_next::data_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("synthhires-bridge")
-            })
-    })
+    cli.config_dir.clone().unwrap_or_else(default_config_dir)
 }
 
 const LOCAL_ORIGIN: &str = "http://localhost:4321";
@@ -388,15 +408,7 @@ async fn background_daemon_task(
 ) -> Result<()> {
     let cli = Cli::parse();
 
-    let config_dir = cli.config_dir.clone().unwrap_or_else(|| {
-        directories::ProjectDirs::from("com", "synthhires", "bridge")
-            .map(|d| d.config_dir().to_path_buf())
-            .unwrap_or_else(|| {
-                dirs_next::data_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("synthhires-bridge")
-            })
-    });
+    let config_dir = cli.config_dir.clone().unwrap_or_else(default_config_dir);
     std::fs::create_dir_all(&config_dir).ok();
 
     let local_port = cli.local_port.unwrap_or(7333);

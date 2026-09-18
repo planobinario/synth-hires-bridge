@@ -1,7 +1,12 @@
-name: Build All Platform Binaries
+name: Build All Platform Binaries & Packages
 
 on:
   push:
+    branches: [main]
+    paths:
+      - 'apps/desktop-daemon/**'
+      - '.github/workflows/build.yml'
+      - 'flake.nix'
     tags:
       - 'v*'
   workflow_dispatch:
@@ -10,30 +15,44 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  desktop:
+  # ── 1. Raw binaries per target ────────────────────────────────────────────
+  binaries:
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Windows x64 — two feature variants (user / system install layout)
           - os: ubuntu-latest
             target: x86_64-pc-windows-gnu
             use_cross: true
-            artifact: synthhires-bridge-windows.exe
+            extra_features: ""
+            artifact: synthhires-bridge-windows-x64-user.exe
+          - os: ubuntu-latest
+            target: x86_64-pc-windows-gnu
+            use_cross: true
+            extra_features: "system-install"
+            artifact: synthhires-bridge-windows-x64-system.exe
+          # Linux x64 + ARM64
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             use_cross: false
+            extra_features: ""
             artifact: synthhires-bridge-linux-x64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             use_cross: true
+            extra_features: ""
             artifact: synthhires-bridge-linux-arm64
+          # macOS x64 + ARM64 (lipo'd into universal later)
           - os: macos-latest
             target: x86_64-apple-darwin
             use_cross: false
+            extra_features: ""
             artifact: synthhires-bridge-macos-x64
           - os: macos-latest
             target: aarch64-apple-darwin
             use_cross: false
+            extra_features: ""
             artifact: synthhires-bridge-macos-arm64
     runs-on: ${{ matrix.os }}
     defaults:
@@ -53,25 +72,171 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cross
-      - name: Cargo check
-        run: cargo check --workspace --all-features
       - name: Build
         run: |
+          FEATURES_FLAG=""
+          if [ -n "${{ matrix.extra_features }}" ]; then FEATURES_FLAG="--features ${{ matrix.extra_features }}"; fi
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
+            cross build --release --target ${{ matrix.target }} $FEATURES_FLAG
             BIN="target/${{ matrix.target }}/release/synthhires-bridge"
             if [[ "${{ matrix.target }}" == *"windows"* ]]; then BIN="$BIN.exe"; fi
-            cp "$BIN" "${{ matrix.artifact }}"
           else
-            cargo build --release
-            cp target/release/synthhires-bridge "${{ matrix.artifact }}"
+            cargo build --release --target ${{ matrix.target }} $FEATURES_FLAG
+            BIN="target/${{ matrix.target }}/release/synthhires-bridge"
           fi
+          cp "$BIN" "${{ matrix.artifact }}"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: apps/desktop-daemon/${{ matrix.artifact }}
 
+  # ── 2. Linux packaging: .deb x64/arm64, .rpm x64/arm64, AppImage x64 ──────
+  package-linux:
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract version
+        id: ver
+        run: echo "version=$(grep -m1 '^version' apps/desktop-daemon/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" >> "$GITHUB_OUTPUT"
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: bins
+      - name: Stage trees
+        run: |
+          chmod +x bins/synthhires-bridge-linux-x64/synthhires-bridge-linux-x64 bins/synthhires-bridge-linux-arm64/synthhires-bridge-linux-arm64
+          # deb trees
+          for arch_pair in "amd64:x64" "arm64:arm64"; do
+            debarch="${arch_pair%%:*}"; tag="${arch_pair##*:}"
+            root="debroot/${tag}/usr/bin"
+            mkdir -p "$root"
+            cp "bins/synthhires-bridge-linux-${tag}/synthhires-bridge-linux-${tag}" "$root/synthhires-bridge"
+          done
+          # rpm staging tarballs
+          for tag in x64 arm64; do
+            mkdir -p "rpmroot/${tag}/usr/bin"
+            cp "bins/synthhires-bridge-linux-${tag}/synthhires-bridge-linux-${tag}" "rpmroot/${tag}/usr/bin/synthhires-bridge"
+            tar -C "rpmroot/${tag}" -czf "synthhires-bridge-${tag}.tar.gz" usr
+          done
+      - name: Build .deb packages (dpkg-deb)
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          for pair in "amd64:x64" "arm64:arm64"; do
+            debarch="${pair%%:*}"; tag="${pair##*:}"
+            mkdir -p "debroot/${tag}/DEBIAN"
+            cat > "debroot/${tag}/DEBIAN/control" <<EOF
+          Package: synthhires-bridge
+          Version: ${V}
+          Section: utils
+          Priority: optional
+          Architecture: ${debarch}
+          Maintainer: SynthHires <hi@synthhires.com>
+          Depends: libc6, libglib2.0-0, libgtk-3-0
+          Description: SynthHires Desktop Daemon
+           Bridges the AI agent to your PC's filesystem and terminal
+           over a single encrypted outbound tunnel.
+          EOF
+            dpkg-deb --build --root-owner-group "debroot/${tag}" "synthhires-bridge-linux-${tag}.deb"
+          done
+      - name: Build .rpm packages (rpmbuild)
+        run: |
+          sudo apt-get install -y rpm
+          V="${{ steps.ver.outputs.version }}"
+          for pair in "x86_64:x64" "aarch64:arm64"; do
+            rarch="${pair%%:*}"; tag="${pair##*:}"
+            topdir="$HOME/rpmbuild-${tag}"
+            mkdir -p "$topdir"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+            cp "synthhires-bridge-${tag}.tar.gz" "$topdir/SOURCES/"
+            cat > "$topdir/SPECS/synthhires-bridge.spec" <<EOF
+          Name:           synthhires-bridge
+          Version:        ${V}
+          Release:        1%{?dist}
+          Summary:        SynthHires Desktop Daemon
+          License:        MIT
+          URL:            https://github.com/planobinario/synthhires-bridge
+          Source0:        synthhires-bridge-${tag}.tar.gz
+          BuildArch:      ${rarch}
+
+          %description
+          Bridges the AI agent to your PC's filesystem and terminal over a
+          single encrypted outbound tunnel.
+
+          %prep
+          %setup -q
+
+          %install
+          mkdir -p %{buildroot}/usr
+          cp -r usr %{buildroot}/
+
+          %files
+          /usr/bin/synthhires-bridge
+
+          %changelog
+          EOF
+            rpmbuild -bb --define "_topdir $topdir" --target "${rarch}" "$topdir/SPECS/synthhires-bridge.spec"
+            find "$topdir/RPMS" -name "*.rpm" -exec cp {} "synthhires-bridge-linux-${tag}.rpm" \;
+          done
+      - name: Build AppImage (x64)
+        run: |
+          curl -sL -o linuxdeploy.AppImage "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
+          chmod +x linuxdeploy.AppImage
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+          cp bins/synthhires-bridge-linux-x64/synthhires-bridge-linux-x64 AppDir/usr/bin/synthhires-bridge
+          chmod +x AppDir/usr/bin/synthhires-bridge
+          cat > AppDir/usr/share/applications/synthhires-bridge.desktop <<EOF
+          [Desktop Entry]
+          Type=Application
+          Name=SynthHires Bridge
+          Exec=synthhires-bridge
+          Icon=synthhires-bridge
+          Categories=Development;Network;
+          EOF
+          # Simple 256x256 placeholder icon (solid indigo square) — replace via repo asset if present
+          if [ -f assets/icon.png ]; then cp assets/icon.png AppDir/usr/share/icons/hicolor/256x256/apps/synthhires-bridge.png
+          else python3 -c "
+          import zlib, struct
+          w=h=256; raw=b''.join(b'\x00'+b'\x6366f1'*w for _ in range(h))
+          def chunk(t,d): c=t+d; return struct.pack('>I',len(d))+c+struct.pack('>I',zlib.crc32(c))
+          png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,2,0,0,0))+chunk(b'IDAT',zlib.compress(raw))+chunk(b'IEND',b'')
+          open('AppDir/usr/share/icons/hicolor/256x256/apps/synthhires-bridge.png','wb').write(png)"
+          fi
+          ./linuxdeploy.AppImage --appimage-extract-and-run --appdir AppDir --output appimage
+          mv SynthHires_Bridge-*.AppImage synthhires-bridge-linux-x64.AppImage || mv *.AppImage synthhires-bridge-linux-x64.AppImage
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: |
+            synthhires-bridge-linux-x64.deb
+            synthhires-bridge-linux-arm64.deb
+            synthhires-bridge-linux-x64.rpm
+            synthhires-bridge-linux-arm64.rpm
+            synthhires-bridge-linux-x64.AppImage
+
+  # ── 3. macOS universal (lipo) ─────────────────────────────────────────────
+  macos-universal:
+    needs: binaries
+    runs-on: macos-latest
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: bins
+      - name: lipo x64 + arm64
+        run: |
+          lipo -create \
+            bins/synthhires-bridge-macos-x64/synthhires-bridge-macos-x64 \
+            bins/synthhires-bridge-macos-arm64/synthhires-bridge-macos-arm64 \
+            -output synthhires-bridge-macos
+          lipo -info synthhires-bridge-macos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: synthhires-bridge-macos
+          path: synthhires-bridge-macos
+
+  # ── 4. NixOS build (flake) ────────────────────────────────────────────────
   nix-build:
     runs-on: ubuntu-latest
     steps:
@@ -80,7 +245,7 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      - name: Check & build with Nix Flake
+      - name: Build with Nix Flake
         run: nix build -L
       - name: Stage Nix binary
         run: |
@@ -91,14 +256,9 @@ jobs:
           name: synthhires-bridge-nixos
           path: nix_out/synthhires-bridge-nixos
 
-  # Tagged releases (v*): attach every platform binary to a GitHub Release
-  # named after the tag, so `releases/download/vX.Y.Z/<asset>` actually
-  # resolves. Without this job the tag build only produced CI artifacts.
-  # The continuously-updated `edge` release (see ci.yml) stays the default
-  # the web serves; this job is for pinned/stable downloads.
-  release:
-    needs: [desktop, nix-build]
-    if: startsWith(github.ref, 'refs/tags/v')
+  # ── 5. Publish: tag release or rolling `edge` ─────────────────────────────
+  publish:
+    needs: [binaries, package-linux, macos-universal, nix-build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -109,19 +269,30 @@ jobs:
       - name: Prepare release assets
         run: |
           mkdir release_assets
-          cp artifacts/synthhires-bridge-windows.exe/synthhires-bridge-windows.exe release_assets/
-          cp artifacts/synthhires-bridge-linux-x64/synthhires-bridge-linux-x64 release_assets/synthhires-bridge-linux
+          # Raw binaries (canonical + explicit arch names)
+          cp artifacts/synthhires-bridge-windows-x64-user.exe/synthhires-bridge-windows-x64-user.exe release_assets/
+          cp artifacts/synthhires-bridge-windows-x64-system.exe/synthhires-bridge-windows-x64-system.exe release_assets/
+          cp artifacts/synthhires-bridge-linux-x64/synthhires-bridge-linux-x64 release_assets/
           cp artifacts/synthhires-bridge-linux-arm64/synthhires-bridge-linux-arm64 release_assets/
-          cp artifacts/synthhires-bridge-macos-x64/synthhires-bridge-macos-x64 release_assets/synthhires-bridge-macos
-          cp artifacts/synthhires-bridge-macos-arm64/synthhires-bridge-macos-arm64 release_assets/
-          if [ -f artifacts/synthhires-bridge-nixos/synthhires-bridge-nixos ]; then
-            cp artifacts/synthhires-bridge-nixos/synthhires-bridge-nixos release_assets/synthhires-bridge-nixos
-          fi
-      - name: Create or update release
+          cp artifacts/synthhires-bridge-macos/synthhires-bridge-macos release_assets/
+          cp artifacts/synthhires-bridge-nixos/synthhires-bridge-nixos release_assets/
+          # Canonical aliases kept for the web's default download map
+          cp artifacts/synthhires-bridge-windows-x64-user.exe/synthhires-bridge-windows-x64-user.exe release_assets/synthhires-bridge-windows.exe
+          cp artifacts/synthhires-bridge-linux-x64/synthhires-bridge-linux-x64 release_assets/synthhires-bridge-linux
+          # Packages
+          cp artifacts/linux-packages/* release_assets/
+          ls -la release_assets/
+      - name: Publish to rolling `edge` release
+        if: github.ref == 'refs/heads/main'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # First run creates the release; re-tagging the same version
-          # falls back to clobbering the assets of the existing release.
+          gh release create edge --title "Edge Build" --prerelease --target main || true
+          gh release upload edge release_assets/* --clobber
+      - name: Publish to versioned tag release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
           gh release create "${{ github.ref_name }}" release_assets/* --generate-notes \
             || gh release upload "${{ github.ref_name }}" release_assets/* --clobber

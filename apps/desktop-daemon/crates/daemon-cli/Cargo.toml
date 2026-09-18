@@ -11,6 +11,13 @@ description = "SynthHires Desktop Daemon — bridges the agent to your PC's file
 name = "synthhires-bridge"
 path = "src/main.rs"
 
+[features]
+default = []
+# System-wide install layout: shared, root-managed state dir
+# (C:\ProgramData on Windows, /var/lib on Linux) instead of per-user
+# ProjectDirs. Used by the *-system.exe packaging variant.
+system-install = []
+
 [build-dependencies]
 winres = "0.1"
 

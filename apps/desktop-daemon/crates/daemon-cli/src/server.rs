@@ -33,6 +33,8 @@ pub struct StatusResponse {
     device_id: Option<String>,
     version: &'static str,
     ws: daemon_core::WsHealthSnapshot,
+    /// Authoritative host OS identification (distro, kernel, arch, libc).
+    os: daemon_core::OsInfo,
 }
 
 #[derive(Deserialize)]
@@ -149,6 +151,7 @@ async fn handle_status(
         device_id,
         version: env!("CARGO_PKG_VERSION"),
         ws: state.ws_health.snapshot(),
+        os: daemon_core::OsInfo::cached().clone(),
     }))
 }
 

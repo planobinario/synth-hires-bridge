@@ -30,8 +30,6 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libglib2.0-dev libgtk-3-dev libdbus-1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libayatana-appindicator3-dev libxdo-dev
       - name: cargo check
         run: cargo check --bin synthhires-bridge
-      - name: cargo build (release)
-        run: cargo build --release --bin synthhires-bridge
       - name: cargo test
         run: cargo test
 
@@ -45,70 +43,3 @@ jobs:
             experimental-features = nix-command flakes
       - name: Check & build with Nix Flake
         run: nix build -L
-      - name: Stage Nix binary
-        run: |
-          mkdir -p nix_out
-          cp -L result/bin/synthhires-bridge nix_out/synthhires-bridge-nixos
-      - uses: actions/upload-artifact@v4
-        with:
-          name: synthhires-bridge-nixos
-          path: nix_out/synthhires-bridge-nixos
-
-  build-release:
-    needs: build
-    strategy:
-      matrix:
-        include:
-          - os: windows-latest
-            artifact: synthhires-bridge.exe
-          - os: macos-latest
-            artifact: synthhires-bridge
-          - os: ubuntu-latest
-            artifact: synthhires-bridge
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: apps/desktop-daemon
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install Linux Dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libglib2.0-dev libgtk-3-dev libdbus-1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libayatana-appindicator3-dev libxdo-dev
-      - run: cargo build --release --bin synthhires-bridge
-      - uses: actions/upload-artifact@v4
-        with:
-          name: synthhires-bridge-${{ matrix.os }}
-          path: apps/desktop-daemon/target/release/${{ matrix.artifact }}
-
-  publish-release:
-    needs: [build-release, nix-build]
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-      - name: Prepare binaries
-        run: |
-          mkdir release_assets
-          cp artifacts/synthhires-bridge-windows-latest/synthhires-bridge.exe release_assets/synthhires-bridge-windows.exe
-          cp artifacts/synthhires-bridge-macos-latest/synthhires-bridge release_assets/synthhires-bridge-macos
-          cp artifacts/synthhires-bridge-ubuntu-latest/synthhires-bridge release_assets/synthhires-bridge-linux
-          if [ -f artifacts/synthhires-bridge-nixos/synthhires-bridge-nixos ]; then
-            cp artifacts/synthhires-bridge-nixos/synthhires-bridge-nixos release_assets/synthhires-bridge-nixos
-          fi
-      - name: Publish Edge Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Create the release if it doesn't exist
-          gh release create edge --title "Edge Build" --prerelease --target main || true
-          
-          # Overwrite the assets with the new ones
-          gh release upload edge release_assets/* --clobber
-
