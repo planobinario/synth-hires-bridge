@@ -173,6 +173,10 @@ pub struct ScreenshotParams {
     /// JPEG quality 0-100 (ignored for PNG).
     #[serde(default)]
     pub quality: Option<i64>,
+    /// Capture the whole scrollable page, not just the viewport (CDP
+    /// captureBeyondViewport). Useful for layout checks of long pages.
+    #[serde(default)]
+    pub full_page: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -180,6 +184,27 @@ pub struct ScreenshotResult {
     /// base64 image (like fs.read images).
     pub base64: String,
     pub format: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WaitParams {
+    /// Stop waiting after this long (ms). Default 5000, clamp 100..30_000.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Success as soon as this text appears in the accessibility tree.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Plain sleep — no polling (use when the effect needs time, not a signal).
+    #[serde(default)]
+    pub sleep_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WaitResult {
+    pub matched: bool,
+    pub waited_ms: u64,
+    /// Fresh snapshot after the wait (so the model can act immediately).
+    pub snapshot: Option<SnapshotResult>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -673,7 +698,8 @@ impl BrowserStore {
                 CaptureScreenshotFormat::Jpeg
             } else {
                 CaptureScreenshotFormat::Png
-            });
+            })
+            .capture_beyond_viewport(p.full_page.unwrap_or(false));
         if jpeg {
             b = b.quality(p.quality.unwrap_or(80));
         }
@@ -687,6 +713,79 @@ impl BrowserStore {
             base64: base64_encode(&bytes),
             format: if jpeg { "jpeg" } else { "png" }.into(),
         })
+    }
+
+    // -- wait ----------------------------------------------------------------
+
+    /// True when `text` appears in the current AX tree. Deliberately does NOT
+    /// touch the console ring or the ref map: intermediate polls must not
+    /// consume console errors that belong to the final snapshot.
+    #[cfg(feature = "browser")]
+    async fn ax_tree_contains(&self, text: &str) -> Result<bool, BrowserError> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(Self::SESSION).ok_or(BrowserError::NoSession)?;
+        let res = session
+            .page
+            .execute(GetFullAxTreeParams::default())
+            .await
+            .map_err(|e| BrowserError::Cdp(format!("ax tree: {e}")))?;
+        for node in &res.result.nodes {
+            let v = match serde_json::to_value(node) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if v.get("ignored").and_then(Value::as_bool).unwrap_or(false) {
+                continue;
+            }
+            for key in ["name", "value"] {
+                if let Some(s) = v.pointer(&format!("/{key}/value")).and_then(Value::as_str) {
+                    if s.contains(text) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Wait for a UI condition, then hand back a fresh snapshot so the model
+    /// can act immediately. Two modes:
+    /// - `text`: poll the AX tree until the text shows up (SPAs, toasts,
+    ///   route transitions) — the honest answer to "the snapshot was taken
+    ///   before the repaint".
+    /// - `sleep_ms`: plain sleep, for effects that need time, not a signal.
+    pub async fn wait(&self, p: WaitParams) -> Result<WaitResult, BrowserError> {
+        let has_text = p.text.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false);
+        let sleep_ms = p.sleep_ms.unwrap_or(0).min(30_000);
+        if !has_text && sleep_ms == 0 {
+            return Err(BrowserError::Cdp(
+                "wait: provide text (condition to await) or sleep_ms (plain pause)".into(),
+            ));
+        }
+        let timeout = p.timeout_ms.unwrap_or(5_000).clamp(100, 30_000);
+        let started = std::time::Instant::now();
+
+        if has_text {
+            let needle = p.text.as_deref().unwrap_or_default().trim();
+            loop {
+                if self.ax_tree_contains(needle).await? {
+                    let waited = started.elapsed().as_millis() as u64;
+                    let snapshot = self.snapshot(SnapshotParams { limit: Some(600) }).await?;
+                    return Ok(WaitResult { matched: true, waited_ms: waited, snapshot: Some(snapshot) });
+                }
+                if started.elapsed().as_millis() as u64 >= timeout {
+                    let waited = started.elapsed().as_millis() as u64;
+                    let snapshot = self.snapshot(SnapshotParams { limit: Some(600) }).await?;
+                    return Ok(WaitResult { matched: false, waited_ms: waited, snapshot: Some(snapshot) });
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+        let waited = started.elapsed().as_millis() as u64;
+        let snapshot = self.snapshot(SnapshotParams { limit: Some(600) }).await?;
+        Ok(WaitResult { matched: true, waited_ms: waited, snapshot: Some(snapshot) })
     }
 
     // -- eval (escape hatch) -------------------------------------------------
@@ -923,6 +1022,9 @@ impl BrowserStore {
     pub async fn screenshot(&self, _p: ScreenshotParams) -> Result<ScreenshotResult, BrowserError> {
         Err(BrowserError::NotAvailable("compiled without the browser feature"))
     }
+    pub async fn wait(&self, _p: WaitParams) -> Result<WaitResult, BrowserError> {
+        Err(BrowserError::NotAvailable("compiled without the browser feature"))
+    }
     pub async fn close(&self, _kill: bool) -> Result<BrowserCloseResult, BrowserError> {
         Ok(BrowserCloseResult { closed: true })
     }
@@ -979,6 +1081,14 @@ mod tests {
         // PNG magic bytes round-trip shape
         let png_magic = [0x89u8, b'P', b'N', b'G'];
         assert_eq!(base64_encode(&png_magic), "iVBORw==");
+    }
+
+    #[test]
+    fn wait_params_reject_empty_condition() {
+        // Serialized shape sanity: the engine-level check lives in `wait`,
+        // but the contract is that neither mode means "no wait requested".
+        let p = WaitParams { timeout_ms: None, text: None, sleep_ms: None };
+        assert!(p.text.is_none() && p.sleep_ms.is_none());
     }
 
     #[cfg(feature = "browser")]

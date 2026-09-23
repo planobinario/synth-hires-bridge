@@ -281,9 +281,8 @@ impl WsClient {
             // rides the same consent tier as shell; snapshots/screenshots are reads.
             "desktop.browser.launch" | "desktop.browser.nav" => "desktop.network.fetch",
             "desktop.browser.act" => "desktop.shell.execute",
-            "desktop.browser.snapshot" | "desktop.browser.shot" | "desktop.browser.close" => {
-                "desktop.fs.read"
-            }
+            "desktop.browser.snapshot" | "desktop.browser.shot" | "desktop.browser.wait"
+            | "desktop.browser.close" => "desktop.fs.read",
             // Debugger: start/eval/flow-control are as powerful as a shell;
             // inspection ops (breakpoints, stack, variables, threads) are reads.
             "desktop.debug.op" => match request.params.get("op").and_then(|v| v.as_str()) {
@@ -745,6 +744,28 @@ impl WsClient {
                 );
                 match parsed {
                     Ok(value) => match self.browser.screenshot(value).await {
+                        Ok(result) => {
+                            self.send_action_result(
+                                ws,
+                                request.id,
+                                true,
+                                Some(serde_json::to_value(&result)?),
+                                None,
+                                elapsed_ms(started),
+                            )
+                            .await
+                        }
+                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                    },
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
+                }
+            }
+            "desktop.browser.wait" => {
+                let parsed = serde_json::from_value::<crate::browser_ops::WaitParams>(
+                    request.params.clone(),
+                );
+                match parsed {
+                    Ok(value) => match self.browser.wait(value).await {
                         Ok(result) => {
                             self.send_action_result(
                                 ws,
