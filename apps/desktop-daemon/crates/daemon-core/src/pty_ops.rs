@@ -76,6 +76,37 @@ pub enum PtyResultPayload {
 
 // ─── Session ─────────────────────────────────────────────────────────────────
 
+/// Strip ANSI escape sequences (CSI + two-byte escapes) and control noise
+/// from PTY output so the model never sees cursor moves, colors or bells.
+/// Input is always valid UTF-8 (`from_utf8_lossy` upstream), so char-wise
+/// iteration is exact.
+fn scrub_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                // CSI: consume params/intermediates up to the final byte.
+                chars.next();
+                while let Some(n) = chars.next() {
+                    if ('\u{40}'..='\u{7e}').contains(&n) {
+                        break;
+                    }
+                }
+            } else {
+                // Two-byte escape (ESC + final): drop both.
+                chars.next();
+            }
+            continue;
+        }
+        if matches!(c, '\u{7}' | '\u{8}' | '\u{b}' | '\u{c}') {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Output accumulator: ring of complete lines + a trailing partial line.
 #[derive(Default)]
 struct OutputBuffer {
@@ -92,12 +123,16 @@ struct VecDequeOutput {
 impl OutputBuffer {
     fn push(&self, chunk: &str) {
         if let Ok(mut buf) = self.lines.lock() {
-            for ch in chunk.chars() {
+            for ch in scrub_ansi(chunk).chars() {
                 if ch == '\n' {
                     let mut line = std::mem::take(&mut buf.partial);
                     line.push('\n');
                     buf.bytes += line.len();
                     line.pop();
+                    // ConPTY emits CRLF; a stray CR would pollute stored lines.
+                    if line.ends_with('\r') {
+                        line.pop();
+                    }
                     buf.lines.push(line);
                     if buf.lines.len() > RING_LINES {
                         let drop = buf.lines.len() - RING_LINES;
@@ -137,7 +172,9 @@ impl OutputBuffer {
 }
 
 struct PtySession {
-    writer: std::sync::Mutex<Box<dyn std::io::Write + Send>>,
+    // Arc so the reader thread can answer ConPTY's DSR query through the same
+    // master input handle the command writers use.
+    writer: Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>,
     child: std::sync::Mutex<Box<dyn portable_pty::Child + Send>>,
     output: Arc<OutputBuffer>,
 }
@@ -257,16 +294,36 @@ impl PtyEngine {
             .master
             .take_writer()
             .map_err(|e| format!("take writer: {e}"))?;
+        let writer = Arc::new(std::sync::Mutex::new(writer));
 
         let output = Arc::new(OutputBuffer::default());
         let output_reader = output.clone();
+        let writer_reader = writer.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             let mut lost = false;
+            // Carry-over so an escape sequence split across reads is still
+            // recognized (the DSR needle is 4 bytes; 8 is plenty).
+            let mut tail: Vec<u8> = Vec::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break, // EOF: shell closed
                     Ok(n) => {
+                        let mut combined = std::mem::take(&mut tail);
+                        combined.extend_from_slice(&buf[..n]);
+                        // ConPTY asks the terminal for the cursor position
+                        // (DSR 6n) and blocks the first paint until it gets an
+                        // answer. A real terminal replies; so do we: row 1,
+                        // col 1. Without this, cmd.exe under ConPTY hangs and
+                        // the first command is swallowed (observed on CI).
+                        if combined.windows(4).any(|w| w == b"\x1b[6n") {
+                            if let Ok(mut w) = writer_reader.lock() {
+                                let _ = std::io::Write::write_all(&mut *w, b"\x1b[1;1R");
+                                let _ = std::io::Write::flush(&mut *w);
+                            }
+                        }
+                        let keep = combined.len().saturating_sub(8);
+                        tail = combined[keep..].to_vec();
                         let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
                         output_reader.push(&chunk);
                     }
@@ -302,7 +359,7 @@ impl PtyEngine {
         }
 
         let entry = Arc::new(PtySession {
-            writer: std::sync::Mutex::new(writer),
+            writer,
             child: std::sync::Mutex::new(child),
             output,
         });
