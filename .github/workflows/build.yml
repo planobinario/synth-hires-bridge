@@ -38,9 +38,14 @@ jobs:
             use_cross: false
             extra_features: ""
             artifact: synthhires-bridge-linux-x64
-          - os: ubuntu-latest
+          # Native ARM64 runner (free for public repos) — cross-compiling
+          # this target with `cross` broke on 2026-09-18 (GUI landing): the
+          # stock cross image lacks arm64 glib/gtk dev libs and its apt
+          # setup can't install them (arm64 python3 postinst needs qemu).
+          # A native runner needs no cross tricks at all.
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            use_cross: true
+            use_cross: false
             extra_features: ""
             artifact: synthhires-bridge-linux-arm64
           # macOS x64 + ARM64 (lipo'd into universal later)
