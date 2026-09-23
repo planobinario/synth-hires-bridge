@@ -40,8 +40,13 @@
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "synthhires-bridge";
           version = "0.1.21";
-          src = ./.;
-          sourceRoot = "source/apps/desktop-daemon";
+          # Wrap the repo so the unpacked source gets a STABLE directory name
+          # (`synthhires-bridge-source`): plain store-path srcs (src = ./.)
+          # land under their hashed basename, which broke sourceRoot below.
+          src = pkgs.runCommand "synthhires-bridge-source" { } ''
+            cp -r ${./.} $out
+          '';
+          sourceRoot = "synthhires-bridge-source/apps/desktop-daemon";
 
           cargoLock = {
             lockFile = ./apps/desktop-daemon/Cargo.lock;

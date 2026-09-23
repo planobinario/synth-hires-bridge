@@ -7,7 +7,6 @@ members = [
 ]
 
 [workspace.package]
-name = "synthhires-bridge-workspace"
 version = "0.1.21"
 edition = "2021"
 license = "MIT"

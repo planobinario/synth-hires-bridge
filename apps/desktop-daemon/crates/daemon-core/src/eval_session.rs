@@ -65,7 +65,6 @@ struct Runtime {
     proc: Child,
     stdin: ChildStdin,
     reader: BufReader<ChildStdout>,
-    program: &'static str,
 }
 
 struct EngineInner {
@@ -313,7 +312,6 @@ fn spawn_runtime() -> Result<Runtime> {
                     proc: child,
                     stdin,
                     reader: BufReader::new(stdout),
-                    program,
                 });
             }
             // Binary not installed → try the next runtime.

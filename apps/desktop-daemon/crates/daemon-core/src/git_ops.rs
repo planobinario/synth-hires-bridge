@@ -8,7 +8,6 @@ use crate::capability::CapabilityGate;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::io::AsyncWriteExt;
 
 type Result<T> = std::result::Result<T, crate::DaemonError>;
 
@@ -314,7 +313,8 @@ impl<'a> GitOps<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // Self-contained parsing tests: no super::* items needed (an unused
+    // import here would fail the CI's -D warnings).
 
     #[test]
     fn porcelain_parsing_shapes() {
