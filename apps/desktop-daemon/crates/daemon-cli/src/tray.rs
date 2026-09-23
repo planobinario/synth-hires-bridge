@@ -56,6 +56,13 @@ pub fn build_tray(
     let quit_id = quit_item.id();
     menu.append(quit_item).ok();
 
+    // NOTE (Linux): the appindicator backend requires the tray to be built
+    // AND pumped on the MAIN thread, but build_tray is currently called from
+    // the tokio background task. tray-icon's internal GTK usage panics there
+    // and the Err branch below degrades gracefully (no tray icon on Linux).
+    // PROPER FIX (future): build the tray on the main thread (e.g. inside
+    // eframe's creation hook) and pump GTK events from BridgeApp::update().
+
     let tray_res = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_icon(icon)

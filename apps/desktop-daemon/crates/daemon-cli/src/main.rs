@@ -839,17 +839,29 @@ async fn background_daemon_task(
     }
 
     let quit_rx = if !cli.headless {
-        let tray_res = tray::build_tray(
-            state.clone(),
-            config_dir.clone(),
-            local_port,
-            ui_ctx.clone(),
-            ui_cmd_tx.clone(),
-        );
+        // build_tray runs INSIDE this tokio task; on Linux the appindicator
+        // backend panics (GTK not initialized on this thread) and an uncaught
+        // panic would kill the whole background task — dead daemon, live
+        // window. catch_unwind contains it so the daemon survives trayless.
+        let tray_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tray::build_tray(
+                state.clone(),
+                config_dir.clone(),
+                local_port,
+                ui_ctx.clone(),
+                ui_cmd_tx.clone(),
+            )
+        }));
         match tray_res {
-            Ok((_handle, rx)) => Some(rx),
-            Err(err) => {
-                tracing::warn!("System tray not available ({err}); continuing in headless mode");
+            Ok(Ok((_handle, rx))) => Some(rx),
+            Ok(Err(err)) => {
+                tracing::warn!("System tray not available ({err}); continuing without tray icon");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "System tray panicked (Linux appindicator needs GTK on the main thread); continuing without tray icon"
+                );
                 None
             }
         }
