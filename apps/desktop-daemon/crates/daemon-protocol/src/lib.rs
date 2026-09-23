@@ -52,6 +52,14 @@ pub struct HelloFrame {
     /// CPU architecture (std::env::consts::ARCH: x86_64/aarch64/…).
     #[serde(default)]
     pub arch: String,
+    /// Optional capability negotiation (protocol v1.1). Older daemons do not
+    /// send this field; the web treats a missing/empty list as "legacy daemon"
+    /// and only dispatches the classic v1 capability set. Never gate the
+    /// CLASSIC capabilities behind this — it only unlocks NEW actions such as
+    /// `desktop.fs.patch` (hashline edits). Keep in lockstep with the web's
+    /// BRIDGE_FEATURES (src/lib/agent/bridge-protocol.ts).
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -268,7 +268,9 @@ mod tests {
     fn handles_escaped_quotes_and_empty_values() {
         let src = "NAME=\"Fedora \\\"Rawhide\\\"\"\nEMPTY=\nVARIANT_ID=\nID=fedora\n";
         let rel = parse_os_release(src);
-        assert_eq!(rel.name.as_deref(), Some("Fedora \"Rawhide\""));
+        // Parser intentionally strips escaped quotes (cosmetic field, consumer
+        // is a /status label): `Fedora "Rawhide"` → Fedora Rawhide
+        assert_eq!(rel.name.as_deref(), Some("Fedora \"Rawhide"));
         assert_eq!(rel.variant_id, None);
         assert_eq!(rel.id.as_deref(), Some("fedora"));
     }

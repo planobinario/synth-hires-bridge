@@ -37,6 +37,9 @@ pub struct WsClient {
     device_kind: &'static str,
     device_name: String,
     gate: Arc<Mutex<CapabilityGate>>,
+    eval: Arc<crate::eval_session::EvalEngine>,
+    lsp: Arc<crate::lsp_ops::LspEngine>,
+    memory: Arc<crate::memory_store::MemoryStore>,
     chat_store: Arc<ChatStore>,
     _consent: Arc<ConsentBroker>,
     health: Arc<WsHealth>,
@@ -56,6 +59,7 @@ impl WsClient {
         consent: Arc<ConsentBroker>,
         health: Arc<WsHealth>,
     ) -> Self {
+        let gate = Arc::new(Mutex::new(gate));
         Self {
             backend_url: backend_url.into(),
             token: token.into(),
@@ -63,7 +67,19 @@ impl WsClient {
             fingerprint: fingerprint.into(),
             device_kind,
             device_name: device_name.into(),
-            gate: Arc::new(Mutex::new(gate)),
+            gate: gate.clone(),
+            // The eval engine shares the SAME gate Arc: a scope update or
+            // revoke on the connection instantly constrains eval too.
+            eval: Arc::new(crate::eval_session::EvalEngine::new(gate.clone())),
+            lsp: Arc::new(crate::lsp_ops::LspEngine::new(gate)),
+            memory: Arc::new(
+                crate::memory_store::MemoryStore::open(crate::memory_store::MemoryStore::default_path())
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("memory.db unavailable ({e}); using in-memory fallback");
+                        crate::memory_store::MemoryStore::open_in_memory()
+                            .expect("in-memory sqlite cannot fail to open")
+                    }),
+            ),
             chat_store,
             _consent: consent,
             health,
@@ -139,6 +155,16 @@ impl WsClient {
             client_version: env!("CARGO_PKG_VERSION").to_string(),
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
+            // Protocol v1.1 capability negotiation. The web only dispatches
+            // new-feature actions to daemons that advertise them.
+            features: vec![
+                "fs.patch".to_string(),
+                "ast".to_string(),
+                "eval".to_string(),
+                "lsp".to_string(),
+                "memory".to_string(),
+                "git".to_string(),
+            ],
         });
         ws.send(Message::Text(serde_json::to_string(&hello)?))
             .await
@@ -213,7 +239,26 @@ impl WsClient {
     ) -> Result<()> {
         self.register_task(&request);
         self.audit(&request);
-        if !self.gate.lock().await.allows(&request.capability) {
+        // Composite actions are authorized by their parent scope (patch/edit
+        // are writes, ast_grep is a read): pairing scopes stay untouched
+        // across daemon updates.
+        let required_scope = match request.capability.as_str() {
+            "desktop.fs.patch" | "desktop.code.ast_edit" => "desktop.fs.write",
+            "desktop.code.ast_grep" => "desktop.fs.read",
+            // Arbitrary JS with require() is shell-equivalent power: gate it
+            // by the terminal-command scope (consent dialog already answered).
+            "desktop.code.eval" | "desktop.lsp.rename" => "desktop.shell.execute",
+            "desktop.lsp.diagnostics" | "desktop.lsp.hover" | "desktop.lsp.definition" => {
+                "desktop.fs.read"
+            }
+            "desktop.memory.recall" | "desktop.memory.stats" => "desktop.fs.read",
+            "desktop.git.overview" | "desktop.git.diff" => "desktop.fs.read",
+            "desktop.memory.remember" | "desktop.memory.forget" | "desktop.memory.reflect" => {
+                "desktop.fs.write"
+            }
+            other => other,
+        };
+        if !self.gate.lock().await.allows(required_scope) {
             return self
                 .send_error(
                     ws,
@@ -252,9 +297,36 @@ impl WsClient {
                 let parsed =
                     serde_json::from_value::<crate::fs_ops::FsReadRequest>(request.params.clone());
                 match parsed {
-                    Ok(value) => match self.path_gate(&request, "desktop.fs.read", &value.path).await {
-                        Ok(gate) => match crate::fs_ops::FsOps::new(&gate).read(value).await {
-                            Ok(result) => self.send_action_result(ws, request.id, true, Some(serde_json::json!({"content_base64": result.content_base64, "size": result.size})), None, elapsed_ms(started)).await,
+                    Ok(value) => {
+                        let annotate = value.annotate.unwrap_or(false);
+                        match self.path_gate(&request, "desktop.fs.read", &value.path).await {
+                            Ok(gate) => match crate::fs_ops::FsOps::new(&gate).read_annotated(value, annotate).await {
+                                Ok(result) => self.send_action_result(ws, request.id, true, Some(serde_json::json!({"content_base64": result.content_base64, "size": result.size})), None, elapsed_ms(started)).await,
+                                Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                            },
+                            Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                        }
+                    }
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
+                }
+            }
+            "desktop.fs.patch" => {
+                let parsed =
+                    serde_json::from_value::<crate::fs_ops::FsPatchRequest>(request.params.clone());
+                match parsed {
+                    Ok(value) => match self.path_gate(&request, "desktop.fs.write", &value.path).await {
+                        Ok(gate) => match crate::fs_ops::FsOps::new(&gate).patch(value).await {
+                            Ok(result) => {
+                                self.send_action_result(
+                                    ws,
+                                    request.id,
+                                    result.verified,
+                                    Some(serde_json::to_value(&result)?),
+                                    (!result.verified).then_some("patch read-back verification failed".into()),
+                                    elapsed_ms(started),
+                                )
+                                .await
+                            }
                             Err(error) => self.send_error(ws, request.id, error.to_string()).await,
                         },
                         Err(error) => self.send_error(ws, request.id, error.to_string()).await,
@@ -271,6 +343,281 @@ impl WsClient {
                             Ok(result) => self.send_action_result(ws, request.id, result.verified, Some(serde_json::json!({"bytes_written": result.bytes_written, "verified": result.verified})), (!result.verified).then_some("write read-back verification failed".into()), elapsed_ms(started)).await,
                             Err(error) => self.send_error(ws, request.id, error.to_string()).await,
                         },
+                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                    },
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
+                }
+            }
+            "desktop.code.ast_grep" => {
+                let parsed = serde_json::from_value::<
+                    crate::ast_ops::AstGrepRequest,
+                >(request.params.clone());
+                match parsed {
+                    Ok(value) => {
+                        let gate = self.gate.lock().await.clone();
+                        match crate::ast_ops::AstOps::new(&gate).grep(value).await {
+                            Ok(result) => {
+                                self.send_action_result(
+                                    ws,
+                                    request.id,
+                                    true,
+                                    Some(serde_json::to_value(&result)?),
+                                    None,
+                                    elapsed_ms(started),
+                                )
+                                .await
+                            }
+                            Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                        }
+                    }
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
+                }
+            }
+            "desktop.code.ast_edit" => {
+                let parsed = serde_json::from_value::<
+                    crate::ast_ops::AstEditRequest,
+                >(request.params.clone());
+                match parsed {
+                    Ok(value) => {
+                        let gate = self.gate.lock().await.clone();
+                        match crate::ast_ops::AstOps::new(&gate).edit(value).await {
+                            Ok(result) => {
+                                self.send_action_result(
+                                    ws,
+                                    request.id,
+                                    result.verified,
+                                    Some(serde_json::to_value(&result)?),
+                                    (!result.verified)
+                                        .then_some("ast_edit read-back verification failed".into()),
+                                    elapsed_ms(started),
+                                )
+                                .await
+                            }
+                            Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                        }
+                    }
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
+                }
+            }
+            "desktop.code.eval" => {
+                let parsed = serde_json::from_value::<crate::eval_session::EvalRequest>(
+                    request.params.clone(),
+                );
+                match parsed {
+                    Ok(value) => match self.eval.exec(value).await {
+                        Ok(result) => {
+                            self.send_action_result(
+                                ws,
+                                request.id,
+                                true,
+                                Some(serde_json::to_value(&result)?),
+                                None,
+                                elapsed_ms(started),
+                            )
+                            .await
+                        }
+                        Err(DaemonError::EvalFailed {
+                            session_id,
+                            created_session,
+                            message,
+                            stdout,
+                            stderr,
+                        }) => {
+                            // A JS-level failure is a SUCCESSFUL action
+                            // transport-wise: the model gets stdout/stderr
+                            // and the session survives for the next turn.
+                            self.send_action_result(
+                                ws,
+                                request.id,
+                                false,
+                                Some(serde_json::json!({
+                                    "sessionId": session_id,
+                                    "createdSession": created_session,
+                                    "error": message,
+                                    "stdout": stdout,
+                                    "stderr": stderr,
+                                })),
+                                None,
+                                elapsed_ms(started),
+                            )
+                            .await
+                        }
+                        Err(other) => self.send_error(ws, request.id, other.to_string()).await,
+                    },
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
+                }
+            }
+            "desktop.lsp.diagnostics" => {
+                let parsed = serde_json::from_value::<crate::lsp_ops::LspFileRequest>(
+                    request.params.clone(),
+                );
+                match parsed {
+                    Ok(value) => match self.lsp.diagnostics(value).await {
+                        Ok(result) => {
+                            self.send_action_result(
+                                ws,
+                                request.id,
+                                true,
+                                Some(serde_json::to_value(&result)?),
+                                None,
+                                elapsed_ms(started),
+                            )
+                            .await
+                        }
+                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                    },
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
+                }
+            }
+            "desktop.lsp.hover" => {
+                let parsed = serde_json::from_value::<crate::lsp_ops::LspPositionRequest>(
+                    request.params.clone(),
+                );
+                match parsed {
+                    Ok(value) => match self.lsp.hover(value).await {
+                        Ok(result) => {
+                            self.send_action_result(
+                                ws,
+                                request.id,
+                                true,
+                                Some(serde_json::to_value(&result)?),
+                                None,
+                                elapsed_ms(started),
+                            )
+                            .await
+                        }
+                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                    },
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
+                }
+            }
+            "desktop.lsp.definition" => {
+                let parsed = serde_json::from_value::<crate::lsp_ops::LspPositionRequest>(
+                    request.params.clone(),
+                );
+                match parsed {
+                    Ok(value) => match self.lsp.definition(value).await {
+                        Ok(result) => {
+                            self.send_action_result(
+                                ws,
+                                request.id,
+                                true,
+                                Some(serde_json::to_value(&result)?),
+                                None,
+                                elapsed_ms(started),
+                            )
+                            .await
+                        }
+                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                    },
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
+                }
+            }
+            "desktop.lsp.rename" => {
+                let parsed = serde_json::from_value::<crate::lsp_ops::LspRenameRequest>(
+                    request.params.clone(),
+                );
+                match parsed {
+                    Ok(value) => match self.lsp.rename(value).await {
+                        Ok(result) => {
+                            self.send_action_result(
+                                ws,
+                                request.id,
+                                result.edits_applied > 0,
+                                Some(serde_json::to_value(&result)?),
+                                None,
+                                elapsed_ms(started),
+                            )
+                            .await
+                        }
+                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                    },
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
+                }
+            }
+            "desktop.memory.remember" | "desktop.memory.recall" | "desktop.memory.forget"
+            | "desktop.memory.reflect" | "desktop.memory.stats" => {
+                let memory = self.memory.clone();
+                let params = request.params.clone();
+                let id = request.id;
+                let started_at = started;
+                // rusqlite is blocking: run the op off the async runtime, but
+                // answer on this connection (respond_to needs ws).
+                let (tx, rx) = tokio::sync::oneshot::channel::<
+                    std::result::Result<serde_json::Value, String>,
+                >();
+                tokio::task::spawn_blocking(move || {
+                    let outcome = match serde_json::from_value::<
+                        crate::memory_store::MemoryOp,
+                    >(params)
+                    {
+                        Ok(op) => match memory.execute(op) {
+                            Ok(result) => serde_json::to_value(&result)
+                                .map_err(|e| format!("serialize: {e}")),
+                            Err(e) => Err(e),
+                        },
+                        Err(e) => Err(format!("bad params: {e}")),
+                    };
+                    let _ = tx.send(outcome);
+                });
+                let elapsed_here = elapsed_ms(started_at);
+                let _ = elapsed_here;
+                match rx.await {
+                    Ok(Ok(value)) => {
+                        self.send_action_result(ws, id, true, Some(value), None, elapsed_ms(started))
+                            .await
+                    }
+                    Ok(Err(message)) => self.send_error(ws, id, message).await,
+                    Err(_) => {
+                        self.send_error(ws, id, "memory: worker dropped".into()).await
+                    }
+                }
+            }
+            "desktop.git.overview" => {
+                let parsed = serde_json::from_value::<crate::git_ops::GitOverviewRequest>(
+                    request.params.clone(),
+                );
+                match parsed {
+                    Ok(value) => match crate::git_ops::GitOps::new(&*self.gate.lock().await)
+                        .overview(value)
+                        .await
+                    {
+                        Ok(result) => {
+                            self.send_action_result(
+                                ws,
+                                request.id,
+                                true,
+                                Some(serde_json::to_value(&result)?),
+                                None,
+                                elapsed_ms(started),
+                            )
+                            .await
+                        }
+                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                    },
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
+                }
+            }
+            "desktop.git.diff" => {
+                let parsed = serde_json::from_value::<crate::git_ops::GitDiffRequest>(
+                    request.params.clone(),
+                );
+                match parsed {
+                    Ok(value) => match crate::git_ops::GitOps::new(&*self.gate.lock().await)
+                        .diff(value)
+                        .await
+                    {
+                        Ok(result) => {
+                            self.send_action_result(
+                                ws,
+                                request.id,
+                                true,
+                                Some(serde_json::to_value(&result)?),
+                                None,
+                                elapsed_ms(started),
+                            )
+                            .await
+                        }
                         Err(error) => self.send_error(ws, request.id, error.to_string()).await,
                     },
                     Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
@@ -678,7 +1025,17 @@ fn task_kind(capability: &str) -> TaskKind {
     match capability {
         "desktop.shell.execute" => TaskKind::ShellExec,
         "desktop.fs.read" => TaskKind::FileRead,
-        "desktop.fs.write" | "desktop.fs.delete" => TaskKind::FileWrite,
+        "desktop.fs.write" | "desktop.fs.delete" | "desktop.fs.patch" | "desktop.code.ast_edit" => {
+            TaskKind::FileWrite
+        }
+        "desktop.code.ast_grep" => TaskKind::FileRead,
+        "desktop.code.eval" | "desktop.lsp.rename" => TaskKind::ShellExec,
+        "desktop.lsp.diagnostics" | "desktop.lsp.hover" | "desktop.lsp.definition" => {
+            TaskKind::FileRead
+        }
+        "desktop.memory.remember" | "desktop.memory.recall" | "desktop.memory.forget"
+        | "desktop.memory.reflect" | "desktop.memory.stats" => TaskKind::DbProxy,
+        "desktop.git.overview" | "desktop.git.diff" => TaskKind::FileRead,
         "sync.chat.push" => TaskKind::DbProxy,
         other => TaskKind::Other(other.to_string()),
     }

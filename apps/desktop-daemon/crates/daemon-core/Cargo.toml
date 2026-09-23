@@ -31,6 +31,8 @@ ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 http = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
+ast-grep-core = "0.45.3"
+ast-grep-language = "0.45.3"
 
 [lib]
 name = "daemon_core"

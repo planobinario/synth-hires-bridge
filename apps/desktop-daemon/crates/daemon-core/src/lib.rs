@@ -8,15 +8,20 @@
 //!   • `keyring`    — OS secure storage wrapper.
 //!   • `fingerprint` — host + OS + machine-id hash.
 
+pub mod ast_ops;
 pub mod audit;
 pub mod autoupdate;
 pub mod capability;
+pub mod eval_session;
 pub mod chat_store;
 pub mod consent;
 pub mod fingerprint;
 pub mod fs_ops;
+pub mod git_ops;
 pub mod health;
 pub mod jni_android;
+pub mod lsp_ops;
+pub mod memory_store;
 pub mod keyring;
 pub mod os_info;
 pub mod pairing;
@@ -62,6 +67,16 @@ pub enum DaemonError {
     Cancelled,
     #[error("timed out after {0}ms")]
     Timeout(u64),
+    /// JS-level eval failure: the transport succeeded, the model receives
+    /// stdout/stderr and the session stays alive for the next turn.
+    #[error("eval failed: {message}")]
+    EvalFailed {
+        session_id: String,
+        created_session: bool,
+        message: String,
+        stdout: String,
+        stderr: String,
+    },
 }
 
 impl From<tungstenite::Error> for DaemonError {

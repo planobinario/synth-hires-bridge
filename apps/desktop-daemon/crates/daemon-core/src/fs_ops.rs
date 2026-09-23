@@ -9,6 +9,7 @@ use crate::{
     DaemonError, Result,
 };
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -17,6 +18,10 @@ pub struct FsReadRequest {
     pub path: PathBuf,
     #[serde(default)]
     pub max_bytes: Option<u64>,
+    /// When true, the content comes back annotated as `NNNN | hash` per
+    /// line so the model can address hashline patches (feature: fs.patch).
+    #[serde(default)]
+    pub annotate: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -330,4 +335,403 @@ fn base64_encode(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+// ─── Hashline patching (feature: fs.patch) ───────────────────────────────
+//
+// OMP-style content-hash anchors. The web reads a file as `NNNN | line`,
+// the model returns edits pointing at those line anchors plus a short hash
+// of the line(s) being replaced. Before applying ANY edit we re-hash the
+// current on-disk lines: a stale anchor (file changed since the read, or a
+// previous patch in the same batch moved the lines) rejects the WHOLE patch
+// atomically — nothing is written. That is the guarantee full-content
+// rewrite cannot give and naive find/replace keeps failing at.
+
+pub const HASHLINE_PREFIX: &str = " | ";
+
+/// Short content hash shown to the model: first 6 hex chars of SHA-256.
+/// Collisions at 24 bits are rare and harmless: a collision only widens
+/// the match candidates, and uniqueness is enforced per-target anyway.
+pub fn short_hash(line: &str) -> String {
+    let digest = sha2::Sha256::digest(line.as_bytes());
+    hex::encode(&digest[..3])
+}
+
+#[cfg(test)]
+fn hashline_lineno(line: &str) -> Option<usize> {
+    let (num, _rest) = line.split_once(HASHLINE_PREFIX)?;
+    num.parse::<usize>().ok()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HashlineEdit {
+    /// 1-indexed line number the edit REPLACES (from the annotated read).
+    pub start_line: usize,
+    /// Inclusive end line. Defaults to start_line (single-line edit).
+    #[serde(default)]
+    pub end_line: Option<usize>,
+    /// Comma-separated short hashes the model saw for those lines. Optional
+    /// for compatibility; when absent the anchor degrades to line-number-only.
+    #[serde(default)]
+    pub hashes: Option<String>,
+    /// Replacement lines. Empty slice deletes the range.
+    #[serde(default)]
+    pub replacement: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FsPatchRequest {
+    pub path: PathBuf,
+    pub edits: Vec<HashlineEdit>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FsPatchApplied {
+    pub start_line: usize,
+    pub end_line: usize,
+    pub lines_added: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FsPatchResult {
+    pub bytes_written: u64,
+    pub verified: bool,
+    pub applied: Vec<FsPatchApplied>,
+}
+
+fn anchor_matches(actual: &[String], expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    expected
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .all(|h| actual.iter().any(|a| a == h))
+}
+
+fn annotate_content(content: &str) -> String {
+    let mut out = String::with_capacity(content.len() + content.lines().count() * 12);
+    for (idx, line) in content.lines().enumerate() {
+        out.push_str(&format!(
+            "{}{}{}\n",
+            idx + 1,
+            HASHLINE_PREFIX,
+            short_hash(line)
+        ));
+    }
+    out
+}
+
+impl<'a> FsOps<'a> {
+    /// Read with `NNNN | hash` annotation, or plain content when requested.
+    pub async fn read_annotated(&self, req: FsReadRequest, annotate: bool) -> Result<FsReadResult> {
+        let mut result = self.read(req).await?;
+        if annotate {
+            let plain = base64_decode(&result.content_base64).ok_or_else(|| {
+                DaemonError::Protocol("fs.read: base64 roundtrip failed".into())
+            })?;
+            let text = String::from_utf8_lossy(&plain);
+            result.content_base64 = base64_encode(annotate_content(&text).as_bytes());
+        }
+        Ok(result)
+    }
+
+    /// Apply a batch of hashline edits atomically: every anchor is verified
+    /// against the on-disk content BEFORE anything is written. One stale
+    /// anchor fails the whole request with the current hashes so the model
+    /// can recover in the next turn. Never writes on failure.
+    pub async fn patch(&self, req: FsPatchRequest) -> Result<FsPatchResult> {
+        self.gate_for_path("desktop.fs.write", &req.path)?;
+        if req.edits.is_empty() {
+            return Err(DaemonError::Protocol("fs.patch: no edits".into()));
+        }
+        let original_bytes = fs::read(&req.path).await.map_err(DaemonError::Io)?;
+        let original = String::from_utf8_lossy(&original_bytes);
+        let mut lines: Vec<String> = original.lines().map(ToOwned::to_owned).collect();
+
+        // Validate all anchors first (positions refer to the ORIGINAL file).
+        let mut planned: Vec<(usize, usize, Vec<String>)> = Vec::with_capacity(req.edits.len());
+        for edit in &req.edits {
+            let start = edit.start_line.max(1);
+            let end = edit.end_line.unwrap_or(edit.start_line).max(start);
+            if end > lines.len() {
+                return Err(DaemonError::Protocol(format!(
+                    "stale_anchor: end_line {} beyond EOF ({} lines). Re-read the file.",
+                    end,
+                    lines.len()
+                )));
+            }
+            let actual: Vec<String> = lines[start - 1..end]
+                .iter()
+                .map(|l| short_hash(l))
+                .collect();
+            if !anchor_matches(&actual, edit.hashes.as_deref()) {
+                return Err(DaemonError::Protocol(PatchAnchorError {
+                    start_line: start,
+                    end_line: end,
+                    expected_hashes: edit.hashes.clone(),
+                    actual_hashes: actual,
+                }
+                .to_string()));
+            }
+            planned.push((start - 1, end, edit.replacement.clone()));
+        }
+
+        // Apply bottom-up so earlier (upper) anchors keep their positions.
+        planned.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut applied: Vec<FsPatchApplied> = Vec::with_capacity(planned.len());
+        let mut last_start: Option<usize> = None;
+        for (idx, end, replacement) in planned {
+            if let Some(prev) = last_start {
+                if end > prev {
+                    return Err(DaemonError::Protocol(
+                        "fs.patch: overlapping edit ranges".into(),
+                    ));
+                }
+            }
+            last_start = Some(idx);
+            let lines_added = replacement.len();
+            lines.splice(idx..end, replacement);
+            applied.push(FsPatchApplied {
+                start_line: idx + 1,
+                end_line: end,
+                lines_added,
+            });
+        }
+        applied.reverse();
+
+        let mut content = lines.join("\n");
+        if original_bytes.ends_with(b"\n") {
+            content.push('\n');
+        }
+        let tmp = req.path.with_extension("synthhires-tmp");
+        fs::write(&tmp, content.as_bytes()).await.map_err(DaemonError::Io)?;
+        if fs::rename(&tmp, &req.path).await.is_err() {
+            let _ = fs::remove_file(&tmp).await;
+            return Err(DaemonError::Io(std::io::Error::other(
+                "patch rename failed",
+            )));
+        }
+        let written = fs::read(&req.path).await.map_err(DaemonError::Io)?;
+        let verified = written == content.as_bytes();
+        Ok(FsPatchResult {
+            bytes_written: written.len() as u64,
+            verified,
+            applied,
+        })
+    }
+}
+
+/// Stale-anchor diagnostic returned to the model when an edit would no
+/// longer land where it was cut from.
+#[derive(Debug)]
+pub struct PatchAnchorError {
+    pub start_line: usize,
+    pub end_line: usize,
+    pub expected_hashes: Option<String>,
+    pub actual_hashes: Vec<String>,
+}
+
+impl std::fmt::Display for PatchAnchorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stale_anchor: lines {}-{} changed since read (expected {:?}, now {:?}). Re-read the file and re-emit the patch.",
+            self.start_line, self.end_line, self.expected_hashes, self.actual_hashes
+        )
+    }
+}
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut table = [255u8; 256];
+    for (i, &c) in ALPHABET.iter().enumerate() {
+        table[c as usize] = i as u8;
+    }
+    let bytes: Vec<u8> = input
+        .bytes()
+        .filter(|b| !b" \t\r\n".contains(b))
+        .collect();
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut chunk = [0u8; 4];
+    let mut filled = 0usize;
+    for &b in &bytes {
+        if b == b'=' {
+            break;
+        }
+        let v = table[b as usize];
+        if v == 255 {
+            return None;
+        }
+        chunk[filled] = v;
+        filled += 1;
+        if filled == 4 {
+            out.push((chunk[0] << 2) | (chunk[1] >> 4));
+            out.push((chunk[1] << 4) | (chunk[2] >> 2));
+            out.push((chunk[2] << 6) | chunk[3]);
+            filled = 0;
+        }
+    }
+    match filled {
+        0 => {}
+        2 => out.push((chunk[0] << 2) | (chunk[1] >> 4)),
+        3 => {
+            out.push((chunk[0] << 2) | (chunk[1] >> 4));
+            out.push((chunk[1] << 4) | (chunk[2] >> 2));
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod hashline_tests {
+    use super::*;
+    use crate::capability::{CapabilityGate, ScopeSnapshot};
+
+    fn test_gate(dir: &std::path::Path) -> CapabilityGate {
+        let snap = ScopeSnapshot {
+            capabilities: vec!["desktop.fs.read".into(), "desktop.fs.write".into()],
+            always_allow_paths: vec![dir.to_path_buf()],
+        };
+        CapabilityGate::new(snap)
+    }
+
+    fn decode(result: &FsReadResult) -> String {
+        String::from_utf8(base64_decode(&result.content_base64).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn annotate_and_patch_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("sh-patch-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("a.txt");
+        tokio::fs::write(&path, "alpha\nbeta\ngamma\n").await.unwrap();
+        let gate = test_gate(&dir);
+        let ops = FsOps::new(&gate);
+
+        // 1. Annotated read shows the same hashes the patch will verify.
+        let annotated = ops
+            .read_annotated(
+                FsReadRequest { path: path.clone(), max_bytes: None, annotate: Some(true) },
+                true,
+            )
+            .await
+            .unwrap();
+        let text = decode(&annotated);
+        assert!(text.contains(&format!("1{}{}", HASHLINE_PREFIX, short_hash("alpha"))));
+        assert!(text.contains(&format!("2{}{}", HASHLINE_PREFIX, short_hash("beta"))));
+
+        // 2. Valid patch replaces line 2 and matches the annotated hash.
+        let result = ops
+            .patch(FsPatchRequest {
+                path: path.clone(),
+                edits: vec![HashlineEdit {
+                    start_line: 2,
+                    end_line: None,
+                    hashes: Some(short_hash("beta")),
+                    replacement: vec!["beta-prime".into()],
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.applied.len(), 1);
+        assert!(result.verified);
+        let after = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(after, "alpha\nbeta-prime\ngamma\n");
+
+        // 3. Stale anchor (old hash) rejects BEFORE writing.
+        let err = ops
+            .patch(FsPatchRequest {
+                path: path.clone(),
+                edits: vec![HashlineEdit {
+                    start_line: 2,
+                    end_line: None,
+                    hashes: Some(short_hash("beta")),
+                    replacement: vec!["x".into()],
+                }],
+            })
+            .await;
+        assert!(err.is_err());
+        let unchanged = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(unchanged, "alpha\nbeta-prime\ngamma\n");
+
+        // 4. Line-number-only anchor still works (hashes=None).
+        ops.patch(FsPatchRequest {
+            path: path.clone(),
+            edits: vec![HashlineEdit {
+                start_line: 1,
+                end_line: None,
+                hashes: None,
+                replacement: vec!["ALPHA".into()],
+            }],
+        })
+        .await
+        .unwrap();
+        let final_text = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(final_text.starts_with("ALPHA\n"));
+
+        // 5. Bottom-up multi-edit: insert+delete in one atomic batch.
+        tokio::fs::write(&path, "one\ntwo\nthree\nfour\n").await.unwrap();
+        let h_two = short_hash("two");
+        let h_four = short_hash("four");
+        let multi = ops
+            .patch(FsPatchRequest {
+                path: path.clone(),
+                edits: vec![
+                    HashlineEdit {
+                        start_line: 2,
+                        end_line: None,
+                        hashes: Some(h_two),
+                        replacement: vec!["dos-a".into(), "dos-b".into()],
+                    },
+                    HashlineEdit {
+                        start_line: 4,
+                        end_line: None,
+                        hashes: Some(h_four),
+                        replacement: vec![],
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        assert_eq!(multi.applied.len(), 2);
+        let after_multi = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(after_multi, "one\ndos-a\ndos-b\nthree\n");
+
+        // 6. Overlapping ranges rejected.
+        tokio::fs::write(&path, "a\nb\nc\n").await.unwrap();
+        let overlap = ops
+            .patch(FsPatchRequest {
+                path: path.clone(),
+                edits: vec![
+                    HashlineEdit { start_line: 1, end_line: Some(2), hashes: None, replacement: vec!["x".into()] },
+                    HashlineEdit { start_line: 2, end_line: Some(3), hashes: None, replacement: vec!["y".into()] },
+                ],
+            })
+            .await;
+        assert!(overlap.is_err());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn hashline_lineno_parses() {
+        assert_eq!(hashline_lineno("42 | a1b2c3"), Some(42));
+        assert_eq!(hashline_lineno("1 | 000000"), Some(1));
+        assert_eq!(hashline_lineno("no prefix"), None);
+        assert_eq!(hashline_lineno("| hash"), None);
+        assert_eq!(hashline_lineno("x | 1a2b3c"), None);
+    }
+
+    #[test]
+    fn base64_roundtrip_matches_encoder() {
+        for sample in ["", "a", "ab", "abc", "abcd", "\u{1F600} emoji"] {
+            let encoded = base64_encode(sample.as_bytes());
+            let decoded = base64_decode(&encoded).unwrap();
+            assert_eq!(decoded, sample.as_bytes());
+        }
+    }
 }
