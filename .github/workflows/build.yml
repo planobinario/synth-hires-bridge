@@ -169,7 +169,9 @@ jobs:
           single encrypted outbound tunnel.
 
           %prep
-          %setup -q
+          # tarball has no top-level dir (contains usr/ directly); -c creates
+          # %{name}-%{version}, cds into it and untars inside.
+          %setup -q -c
 
           %install
           mkdir -p %{buildroot}/usr
