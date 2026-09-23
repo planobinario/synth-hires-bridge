@@ -35,7 +35,7 @@ const RING_LINES: usize = 1_000;
 // ─── Requests / results ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", tag = "op")]
+#[serde(rename_all_fields = "camelCase", tag = "op")]
 pub enum PtyOp {
     #[serde(rename = "run")]
     Run {
@@ -55,7 +55,7 @@ pub enum PtyOp {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase", tag = "op")]
+#[serde(rename_all_fields = "camelCase", tag = "op")]
 pub enum PtyResultPayload {
     #[serde(rename = "run")]
     Run {

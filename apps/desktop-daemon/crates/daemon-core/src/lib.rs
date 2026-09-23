@@ -10,6 +10,10 @@
 
 pub mod ast_ops;
 pub mod audit;
+// Always compiled: real impl behind the `browser` feature, API-preserving stubs
+// without it (ws_client dispatches uniformly either way).
+pub mod browser_ops;
+pub mod dap_ops;
 pub mod autoupdate;
 pub mod capability;
 pub mod eval_session;

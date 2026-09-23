@@ -41,7 +41,7 @@ const PROBE_TIMEOUT_MS: u64 = 400;
 // ─── Requests (camelCase over the wire, tag = "op") ──────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", tag = "op")]
+#[serde(rename_all_fields = "camelCase", tag = "op")]
 pub enum ProcOp {
     #[serde(rename = "start")]
     Start {
@@ -81,7 +81,7 @@ pub enum ProcOp {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase", tag = "op")]
+#[serde(rename_all_fields = "camelCase", tag = "op")]
 pub enum ProcResultPayload {
     #[serde(rename = "start")]
     Start { id: Uuid },

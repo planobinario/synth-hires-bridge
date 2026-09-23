@@ -113,8 +113,12 @@ fn frame_message(body: &str) -> Vec<u8> {
 }
 
 /// Read one framed message. None on clean EOF at a message boundary.
-async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
+/// Read one framed message. None on clean EOF at a message boundary.
+/// Shared with the DAP bridge (same base protocol); `label` names the
+/// subsystem in error strings ("lsp" / "dap").
+pub(crate) async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
+    label: &str,
 ) -> std::io::Result<Option<String>> {
     // Header section: lines terminated by \r\n, ended by an empty line.
     let mut header = Vec::new();
@@ -128,10 +132,10 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
             break;
         }
         if header.len() > 8192 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "lsp: header section too long",
-            ));
+            return Err(        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{label}: header section too long"),
+        ));
         }
     }
     let header_text = std::str::from_utf8(&header)
@@ -145,12 +149,15 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
         }
     }
     let len = content_length.ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "lsp: missing Content-Length")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{label}: missing Content-Length"),
+        )
     })?;
     if len == 0 || len > MAX_FRAME_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "lsp: frame size out of bounds",
+            format!("{label}: frame size out of bounds"),
         ));
     }
     let mut body = vec![0u8; len];
@@ -600,7 +607,7 @@ fn spawn_server(
                 });
             }
             loop {
-                match read_frame(&mut reader).await {
+                match read_frame(&mut reader, "lsp").await {
                     Ok(Some(body)) => {
                         let msg: Value = match serde_json::from_str(&body) {
                             Ok(v) => v,
@@ -775,17 +782,17 @@ mod tests {
         let framed = frame_message(body);
         let text = String::from_utf8(framed).unwrap();
         assert!(text.starts_with(&format!("Content-Length: {}\r\n\r\n", body.len())));
-        let read_back = read_frame(&mut text.as_bytes()).await.unwrap().unwrap();
+        let read_back = read_frame(&mut text.as_bytes(), "lsp").await.unwrap().unwrap();
         assert_eq!(read_back, body);
         // Unframed input with no Content-Length: EOF at a boundary → None.
         let junk = "no framing here";
-        assert!(read_frame(&mut junk.as_bytes()).await.unwrap().is_none());
+        assert!(read_frame(&mut junk.as_bytes(), "lsp").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn header_parsing_is_case_insensitive() {
         let raw = b"content-length: 2\r\n\r\n{}";
-        assert_eq!(read_frame(&mut raw.as_slice()).await.unwrap().unwrap(), "{}");
+        assert_eq!(read_frame(&mut raw.as_slice(), "lsp").await.unwrap().unwrap(), "{}");
     }
 
     #[test]

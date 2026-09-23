@@ -42,6 +42,8 @@ pub struct WsClient {
     memory: Arc<crate::memory_store::MemoryStore>,
     proc: Arc<crate::proc_ops::ProcEngine>,
     pty: Arc<crate::pty_ops::PtyEngine>,
+    browser: Arc<crate::browser_ops::BrowserStore>,
+    dap: Arc<crate::dap_ops::DapEngine>,
     chat_store: Arc<ChatStore>,
     _consent: Arc<ConsentBroker>,
     health: Arc<WsHealth>,
@@ -76,6 +78,8 @@ impl WsClient {
             lsp: Arc::new(crate::lsp_ops::LspEngine::new(gate.clone())),
             proc: Arc::new(crate::proc_ops::ProcEngine::new(gate.clone())),
             pty: Arc::new(crate::pty_ops::PtyEngine::new(gate.clone())),
+            browser: Arc::new(crate::browser_ops::BrowserStore::new()),
+            dap: Arc::new(crate::dap_ops::DapEngine::new(gate.clone())),
             memory: Arc::new(
                 crate::memory_store::MemoryStore::open(crate::memory_store::MemoryStore::default_path())
                     .unwrap_or_else(|e| {
@@ -170,6 +174,8 @@ impl WsClient {
                 "git".to_string(),
                 "proc".to_string(),
                 "pty".to_string(),
+                "browser".to_string(),
+                "dap".to_string(),
             ],
         });
         ws.send(Message::Text(serde_json::to_string(&hello)?))
@@ -271,6 +277,21 @@ impl WsClient {
                 _ => "desktop.fs.read", // logs / wait / list
             }
             "desktop.pty.op" => "desktop.shell.execute", // a PTY is a terminal
+            // Browser: navigate ≈ network read; act (click/type in real pages)
+            // rides the same consent tier as shell; snapshots/screenshots are reads.
+            "desktop.browser.launch" | "desktop.browser.nav" => "desktop.network.fetch",
+            "desktop.browser.act" => "desktop.shell.execute",
+            "desktop.browser.snapshot" | "desktop.browser.shot" | "desktop.browser.close" => {
+                "desktop.fs.read"
+            }
+            // Debugger: start/eval/flow-control are as powerful as a shell;
+            // inspection ops (breakpoints, stack, variables, threads) are reads.
+            "desktop.debug.op" => match request.params.get("op").and_then(|v| v.as_str()) {
+                Some("start") | Some("eval") | Some("continue") | Some("step") | Some("pause") => {
+                    "desktop.shell.execute"
+                }
+                _ => "desktop.fs.read",
+            }
             other => other,
         };
         if !self.gate.lock().await.allows(required_scope) {
@@ -626,6 +647,158 @@ impl WsClient {
                             .await
                         }
                         Err(error) => self.send_error(ws, request.id, error).await,
+                    },
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
+                }
+            }
+            "desktop.browser.launch" => {
+                let parsed = serde_json::from_value::<crate::browser_ops::BrowserLaunchParams>(
+                    request.params.clone(),
+                );
+                match parsed {
+                    Ok(value) => match self.browser.launch(value).await {
+                        Ok(result) => {
+                            self.send_action_result(
+                                ws,
+                                request.id,
+                                true,
+                                Some(serde_json::to_value(&result)?),
+                                None,
+                                elapsed_ms(started),
+                            )
+                            .await
+                        }
+                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                    },
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
+                }
+            }
+            "desktop.browser.nav" => {
+                let parsed = serde_json::from_value::<crate::browser_ops::BrowserNavigateParams>(
+                    request.params.clone(),
+                );
+                match parsed {
+                    Ok(value) => match self.browser.navigate(value).await {
+                        Ok(result) => {
+                            self.send_action_result(
+                                ws,
+                                request.id,
+                                true,
+                                Some(serde_json::to_value(&result)?),
+                                None,
+                                elapsed_ms(started),
+                            )
+                            .await
+                        }
+                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                    },
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
+                }
+            }
+            "desktop.browser.snapshot" => {
+                let parsed = serde_json::from_value::<crate::browser_ops::SnapshotParams>(
+                    request.params.clone(),
+                );
+                match parsed {
+                    Ok(value) => match self.browser.snapshot(value).await {
+                        Ok(result) => {
+                            self.send_action_result(
+                                ws,
+                                request.id,
+                                true,
+                                Some(serde_json::to_value(&result)?),
+                                None,
+                                elapsed_ms(started),
+                            )
+                            .await
+                        }
+                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                    },
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
+                }
+            }
+            "desktop.browser.act" => {
+                let parsed = serde_json::from_value::<crate::browser_ops::BrowserActParams>(
+                    request.params.clone(),
+                );
+                match parsed {
+                    Ok(value) => match self.browser.act(value).await {
+                        Ok(result) => {
+                            self.send_action_result(
+                                ws,
+                                request.id,
+                                true,
+                                Some(serde_json::to_value(&result)?),
+                                None,
+                                elapsed_ms(started),
+                            )
+                            .await
+                        }
+                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                    },
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
+                }
+            }
+            "desktop.browser.shot" => {
+                let parsed = serde_json::from_value::<crate::browser_ops::ScreenshotParams>(
+                    request.params.clone(),
+                );
+                match parsed {
+                    Ok(value) => match self.browser.screenshot(value).await {
+                        Ok(result) => {
+                            self.send_action_result(
+                                ws,
+                                request.id,
+                                true,
+                                Some(serde_json::to_value(&result)?),
+                                None,
+                                elapsed_ms(started),
+                            )
+                            .await
+                        }
+                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                    },
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
+                }
+            }
+            "desktop.debug.op" => {
+                let parsed = serde_json::from_value::<crate::dap_ops::DapOp>(request.params.clone());
+                match parsed {
+                    Ok(value) => match self.dap.execute(value).await {
+                        Ok(result) => {
+                            self.send_action_result(
+                                ws,
+                                request.id,
+                                true,
+                                Some(result),
+                                None,
+                                elapsed_ms(started),
+                            )
+                            .await
+                        }
+                        Err(error) => self.send_error(ws, request.id, error).await,
+                    },
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
+                }
+            }
+            "desktop.browser.close" => {
+                let parsed = serde_json::from_value::<crate::browser_ops::BrowserCloseParams>(
+                    request.params.clone(),
+                );
+                match parsed {
+                    Ok(value) => match self.browser.close(value.kill).await {
+                        Ok(result) => {
+                            self.send_action_result(
+                                ws,
+                                request.id,
+                                true,
+                                Some(serde_json::to_value(&result)?),
+                                None,
+                                elapsed_ms(started),
+                            )
+                            .await
+                        }
+                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
                     },
                     Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
                 }

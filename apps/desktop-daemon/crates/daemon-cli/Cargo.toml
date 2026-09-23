@@ -22,7 +22,7 @@ system-install = []
 winres = "0.1"
 
 [dependencies]
-daemon-core = { path = "../daemon-core" }
+daemon-core = { path = "../daemon-core", features = ["browser"] }
 daemon-protocol = { path = "../daemon-protocol" }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
