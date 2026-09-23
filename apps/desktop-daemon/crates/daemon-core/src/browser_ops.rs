@@ -806,6 +806,7 @@ fn console_args_text(ev: &Value) -> String {
 // ---------------------------------------------------------------------------
 
 /// Extract readable text from an AxValue JSON (`{type, value}`).
+#[cfg_attr(not(feature = "browser"), allow(dead_code))]
 fn ax_text(v: Option<&Value>) -> String {
     let v = match v {
         Some(v) => v,
@@ -824,6 +825,7 @@ fn ax_text(v: Option<&Value>) -> String {
 /// approximation: count how deep the node's id appears nested in other nodes'
 /// childIds (built once per snapshot by the caller loop — O(n²) worst case but
 /// n is capped at a few hundred).
+#[cfg_attr(not(feature = "browser"), allow(dead_code))]
 fn node_depth(node: &Value, _node_id: &str) -> usize {
     // The full tree isn't available here; keep flat layout but mark roots.
     // A cheap, stable heuristic: depth is provided implicitly by childIds of
@@ -837,6 +839,7 @@ fn node_depth(node: &Value, _node_id: &str) -> usize {
 
 /// Center of the first usable quad. Quads arrive as arrays of 8 numbers
 /// (4 corner points) — serialize-shape-agnostic.
+#[cfg_attr(not(feature = "browser"), allow(dead_code))]
 fn quad_center(quads: &Value) -> Option<(f64, f64)> {
     let arr = quads.as_array()?;
     for q in arr {
@@ -859,6 +862,7 @@ fn quad_center(quads: &Value) -> Option<(f64, f64)> {
 }
 
 /// Minimal standard base64 (RFC 4648) — avoids adding a dependency for one fn.
+#[cfg_attr(not(feature = "browser"), allow(dead_code))]
 fn base64_encode(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);

@@ -188,10 +188,22 @@ impl PtyEngine {
     }
 
     fn shell_program() -> &'static str {
+        // Windows: cmd.exe, not PowerShell. PSReadLine + ConPTY on runners is
+        // fragile (slow boot, process dying at spawn); cmd is the first-class
+        // ConPTY citizen. cwd/env/state persist identically.
         if cfg!(windows) {
-            "powershell"
+            "cmd"
         } else {
             "bash"
+        }
+    }
+
+    fn eol() -> &'static str {
+        // ConPTY consumers (cmd/PowerShell) need CRLF; Unix shells want LF.
+        if cfg!(windows) {
+            "\r\n"
+        } else {
+            "\n"
         }
     }
 
@@ -233,7 +245,7 @@ impl PtyEngine {
                 .or_else(|_| std::env::var("USERPROFILE"))
                 .unwrap_or_else(|_| ".".into()),
         );
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| format!("spawn {}: {e}", Self::shell_program()))?;
@@ -267,6 +279,27 @@ impl PtyEngine {
                 }
             }
         });
+
+        // Wait for the shell to paint its prompt (or die) before the first
+        // write: slow-starting shells on CI/Windows would otherwise swallow
+        // the first command into the void. Bounded; then discard the banner
+        // so the first `run` returns only the command's own output.
+        let start = std::time::Instant::now();
+        while !output.pending() && start.elapsed() < std::time::Duration::from_secs(3) {
+            // Shell died while booting: no point waiting for a prompt.
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = output.drain();
+        if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+            return Err(format!(
+                "spawn {}: shell exited immediately (unavailable or crashed); retry later",
+                Self::shell_program()
+            ));
+        }
 
         let entry = Arc::new(PtySession {
             writer: std::sync::Mutex::new(writer),
@@ -302,8 +335,9 @@ impl PtyEngine {
         }
         {
             let mut writer = shell.writer.lock().unwrap();
-            writeln!(&mut *writer, "{command}").map_err(|e| format!("write: {e}"))?;
-            writer.flush().map_err(|e| format!("flush: {e}"))?;
+            std::io::Write::write_all(&mut *writer, format!("{command}{}", Self::eol()).as_bytes())
+                .map_err(|e| format!("write: {e}"))?;
+            std::io::Write::flush(&mut *writer).map_err(|e| format!("flush: {e}"))?;
         }
         // Wait for output to settle: sleep in slices until either the
         // timeout passes or no new bytes arrive for ~2 quiet slices.
@@ -375,7 +409,7 @@ impl PtyEngine {
         if let Some(shell) = dead {
             {
                 let mut writer = shell.writer.lock().unwrap();
-                let _ = std::io::Write::write_all(&mut *writer, b"exit\n");
+                let _ = std::io::Write::write_all(&mut *writer, format!("exit{}", Self::eol()).as_bytes());
                 let _ = std::io::Write::flush(&mut *writer);
             }
             let _ = shell
@@ -416,11 +450,13 @@ mod tests {
     async fn state_persists_between_calls() {
         let engine = engine();
         let session = session_id("persist");
-        // Set a variable, then read it back in a second call.
+        // Set a variable, then read it back in a second call (shell-agnostic
+        // syntax: cmd.exe on Windows, POSIX shell on Unix).
+        let set_cmd = if cfg!(windows) { "set SHPTY_TEST_VAR=hello_state" } else { "SHPTY_TEST_VAR=hello_state" };
         let PtyResultPayload::Run { output, exited, .. } = engine
             .execute(PtyOp::Run {
                 session: session.clone(),
-                command: "SHPTY_TEST_VAR=hello_state".into(),
+                command: set_cmd.into(),
                 timeout_ms: Some(5_000),
             })
             .await
@@ -428,9 +464,9 @@ mod tests {
         else {
             panic!("run expected")
         };
-        assert!(!exited);
+        assert!(!exited, "shell must survive after setting a variable");
         let _ = output;
-        let probe = if cfg!(windows) { "echo $env:SHPTY_TEST_VAR" } else { "echo $SHPTY_TEST_VAR" };
+        let probe = if cfg!(windows) { "echo %SHPTY_TEST_VAR%" } else { "echo $SHPTY_TEST_VAR" };
         let PtyResultPayload::Run { output, .. } = engine
             .execute(PtyOp::Run { session, command: probe.into(), timeout_ms: Some(5_000) })
             .await
