@@ -40,6 +40,8 @@ pub struct WsClient {
     eval: Arc<crate::eval_session::EvalEngine>,
     lsp: Arc<crate::lsp_ops::LspEngine>,
     memory: Arc<crate::memory_store::MemoryStore>,
+    proc: Arc<crate::proc_ops::ProcEngine>,
+    pty: Arc<crate::pty_ops::PtyEngine>,
     chat_store: Arc<ChatStore>,
     _consent: Arc<ConsentBroker>,
     health: Arc<WsHealth>,
@@ -71,7 +73,9 @@ impl WsClient {
             // The eval engine shares the SAME gate Arc: a scope update or
             // revoke on the connection instantly constrains eval too.
             eval: Arc::new(crate::eval_session::EvalEngine::new(gate.clone())),
-            lsp: Arc::new(crate::lsp_ops::LspEngine::new(gate)),
+            lsp: Arc::new(crate::lsp_ops::LspEngine::new(gate.clone())),
+            proc: Arc::new(crate::proc_ops::ProcEngine::new(gate.clone())),
+            pty: Arc::new(crate::pty_ops::PtyEngine::new(gate.clone())),
             memory: Arc::new(
                 crate::memory_store::MemoryStore::open(crate::memory_store::MemoryStore::default_path())
                     .unwrap_or_else(|e| {
@@ -164,6 +168,8 @@ impl WsClient {
                 "lsp".to_string(),
                 "memory".to_string(),
                 "git".to_string(),
+                "proc".to_string(),
+                "pty".to_string(),
             ],
         });
         ws.send(Message::Text(serde_json::to_string(&hello)?))
@@ -256,6 +262,15 @@ impl WsClient {
             "desktop.memory.remember" | "desktop.memory.forget" | "desktop.memory.reflect" => {
                 "desktop.fs.write"
             }
+            // One capability, scope derived from the actual op in params —
+            // an op can never ride in under a weaker sibling's scope.
+            "desktop.proc.op" => match request.params.get("op").and_then(|v| v.as_str()) {
+                Some("signal") => "desktop.process.kill",
+                Some("probe") => "desktop.network.fetch",
+                Some("start") => "desktop.shell.execute",
+                _ => "desktop.fs.read", // logs / wait / list
+            }
+            "desktop.pty.op" => "desktop.shell.execute", // a PTY is a terminal
             other => other,
         };
         if !self.gate.lock().await.allows(required_scope) {
@@ -571,6 +586,48 @@ impl WsClient {
                     Err(_) => {
                         self.send_error(ws, id, "memory: worker dropped".into()).await
                     }
+                }
+            }
+            "desktop.proc.op" => {
+                let parsed =
+                    serde_json::from_value::<crate::proc_ops::ProcOp>(request.params.clone());
+                match parsed {
+                    Ok(value) => match self.proc.execute(value).await {
+                        Ok(result) => {
+                            self.send_action_result(
+                                ws,
+                                request.id,
+                                true,
+                                Some(serde_json::to_value(&result)?),
+                                None,
+                                elapsed_ms(started),
+                            )
+                            .await
+                        }
+                        Err(error) => self.send_error(ws, request.id, error).await,
+                    },
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
+                }
+            }
+            "desktop.pty.op" => {
+                let parsed =
+                    serde_json::from_value::<crate::pty_ops::PtyOp>(request.params.clone());
+                match parsed {
+                    Ok(value) => match self.pty.execute(value).await {
+                        Ok(result) => {
+                            self.send_action_result(
+                                ws,
+                                request.id,
+                                true,
+                                Some(serde_json::to_value(&result)?),
+                                None,
+                                elapsed_ms(started),
+                            )
+                            .await
+                        }
+                        Err(error) => self.send_error(ws, request.id, error).await,
+                    },
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
                 }
             }
             "desktop.git.overview" => {

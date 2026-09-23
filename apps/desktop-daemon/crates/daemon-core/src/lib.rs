@@ -25,6 +25,8 @@ pub mod memory_store;
 pub mod keyring;
 pub mod os_info;
 pub mod pairing;
+pub mod proc_ops;
+pub mod pty_ops;
 pub mod shell;
 pub mod system_ops;
 pub mod task_registry;
