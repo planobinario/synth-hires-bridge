@@ -1,26 +1,45 @@
-//! Persistent PTY shell (feature: pty) — stateful shell sessions.
+//! Persistent shell sessions (feature: pty) — stateful shells, one per chat.
 //!
 //! `desktop.shell.execute` is stateless (fresh process per call) and
 //! `desktop.proc.op` manages detached background processes. This fills the
 //! gap: ONE long-lived shell per session whose cwd, environment variables,
-//! virtualenvs and exit-code ($?) survive between calls — like a real
-//! terminal the agent keeps open while it works.
+//! virtualenvs and exit codes survive between calls — like a real terminal
+//! the agent keeps open while it works.
 //!
-//! Design notes:
-//! - portable-pty (wezterm's crate) for real cross-platform PTYs (ConPTY on
-//!   Windows, openpty on Unix). No PTY → clean error, not a fallback shell.
+//! Backend per platform:
+//! - **Unix**: real PTY via portable-pty (wezterm's crate). A pty is the
+//!   honest thing on Unix — job control, TTY detection and colors all work.
+//! - **Windows**: plain stdin/stdout pipes to `cmd /q`. ConPTY requires the
+//!   host to BE a terminal emulator (answer DSR-6n cursor queries, drive
+//!   repaint sync, consume VT sequences); a pipe host cannot answer
+//!   correctly and shells stall or die mid-session (observed on CI: the
+//!   first prompt never paints, or the process dies right after a command).
+//!   Plain pipes are deterministic, keep per-session state just as well,
+//!   and `/q` keeps output clean (no prompt, no command echo).
+//!
+//! Shared design:
 //! - One shell per session id (the web sends the conversation id): a
-//!   different chat gets its own shell. Shells cap and evict LRU (the oldest
-//!   dies when a new one would exceed the cap).
+//!   different chat gets its own shell. Shells cap and evict (oldest dies
+//!   when a new one would exceed the cap).
+//! - Deterministic boot handshake: the host writes `echo __BRIDGE_READY__`
+//!   and waits for the marker to appear in the output ring. When it does,
+//!   the shell has provably consumed stdin and executed a command — no
+//!   prompt parsing, no fixed sleeps. The banner + marker are then drained.
 //! - Output lands in a ring buffer (last 1000 lines / 64 KiB per shell);
-//!   `read` drains new bytes since the last read for that session.
+//!   `read` drains new bytes since the last read for that session. ANSI
+//!   escapes and control noise are scrubbed so the model sees plain text.
 //! - Power scope: same as arbitrary execution (`desktop.shell.execute`) —
-//!   a PTY is a terminal.
-//! - `exit` kills the shell process; sessions also die on drop via the
-//!   writer/reader handles.
+//!   a persistent shell is a terminal.
+//! - `exit` writes the shell's exit command, then kills the process; dead
+//!   sessions are also reaped on drop.
 
-use crate::capability::CapabilityGate;
+#[cfg(not(windows))]
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
+#[cfg(windows)]
+use std::process::{Child as StdChild, Command as StdCommand, Stdio};
+use crate::capability::CapabilityGate;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read as _;
@@ -31,6 +50,16 @@ type PtyResult<T> = Result<T, String>;
 
 const MAX_SESSIONS: usize = 8;
 const RING_LINES: usize = 1_000;
+
+/// Marker the host echoes through the shell to prove it is accepting
+/// commands (boot handshake). Chosen to never collide with real output.
+const BOOT_MARKER: &str = "__BRIDGE_READY__";
+/// Bound on the boot handshake — shells start in well under a second even
+/// on cold CI runners; past this the backend is broken, fail loudly.
+const BOOT_TIMEOUT_MS: u64 = 10_000;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 // ─── Requests / results ──────────────────────────────────────────────────────
 
@@ -74,10 +103,10 @@ pub enum PtyResultPayload {
     Exit { session: String, exited: bool },
 }
 
-// ─── Session ─────────────────────────────────────────────────────────────────
+// ─── Output buffer ───────────────────────────────────────────────────────────
 
 /// Strip ANSI escape sequences (CSI + two-byte escapes) and control noise
-/// from PTY output so the model never sees cursor moves, colors or bells.
+/// from shell output so the model never sees cursor moves, colors, bells.
 /// Input is always valid UTF-8 (`from_utf8_lossy` upstream), so char-wise
 /// iteration is exact.
 fn scrub_ansi(s: &str) -> String {
@@ -110,11 +139,11 @@ fn scrub_ansi(s: &str) -> String {
 /// Output accumulator: ring of complete lines + a trailing partial line.
 #[derive(Default)]
 struct OutputBuffer {
-    lines: std::sync::Mutex<VecDequeOutput>,
+    lines: std::sync::Mutex<BufferState>,
 }
 
 #[derive(Default)]
-struct VecDequeOutput {
+struct BufferState {
     lines: Vec<std::string::String>,
     partial: String,
     bytes: usize,
@@ -129,7 +158,7 @@ impl OutputBuffer {
                     line.push('\n');
                     buf.bytes += line.len();
                     line.pop();
-                    // ConPTY emits CRLF; a stray CR would pollute stored lines.
+                    // Windows pipes emit CRLF; a stray CR would pollute lines.
                     if line.ends_with('\r') {
                         line.pop();
                     }
@@ -148,6 +177,12 @@ impl OutputBuffer {
                 buf.partial.drain(..cut);
             }
         }
+    }
+
+    fn contains(&self, needle: &str) -> bool {
+        self.lines.lock().map(|b| {
+            b.lines.iter().any(|l| l.contains(needle)) || b.partial.contains(needle)
+        }).unwrap_or(false)
     }
 
     fn drain(&self) -> String {
@@ -171,30 +206,143 @@ impl OutputBuffer {
     }
 }
 
+// ─── Session ─────────────────────────────────────────────────────────────────
+
+/// Platform backend for one shell session.
+enum ShellIo {
+    /// Unix: real PTY; the child is killed via wezterm's ChildKiller trait.
+    #[cfg(not(windows))]
+    Pty { child: std::sync::Mutex<Box<dyn portable_pty::Child + Send>> },
+    /// Windows: `cmd /q` over plain pipes; a regular std Child.
+    #[cfg(windows)]
+    Pipes { child: std::sync::Mutex<StdChild> },
+}
+
+fn shell_alive(io: &ShellIo) -> bool {
+    match io {
+        #[cfg(not(windows))]
+        ShellIo::Pty { child } => match child.lock().map(|mut c| c.try_wait()) {
+            Ok(Ok(None)) => true,
+            _ => false,
+        },
+        #[cfg(windows)]
+        ShellIo::Pipes { child } => match child.lock().map(|mut c| c.try_wait()) {
+            Ok(Ok(None)) => true,
+            _ => false,
+        },
+    }
+}
+
+fn kill_shell(io: &ShellIo) {
+    match io {
+        #[cfg(not(windows))]
+        ShellIo::Pty { child } => {
+            if let Ok(mut child) = child.lock() {
+                let _ = portable_pty::ChildKiller::kill(&mut **child);
+            }
+        }
+        #[cfg(windows)]
+        ShellIo::Pipes { child } => {
+            if let Ok(mut child) = child.lock() {
+                let _ = child.kill();
+            }
+        }
+    }
+}
+
 struct PtySession {
-    // Arc so the reader thread can answer ConPTY's DSR query through the same
-    // master input handle the command writers use.
+    // Arc so reader threads and command writers share the shell's stdin
+    // (on Unix through the pty master, on Windows through the pipe).
     writer: Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>,
-    child: std::sync::Mutex<Box<dyn portable_pty::Child + Send>>,
+    io: ShellIo,
     output: Arc<OutputBuffer>,
 }
 
 impl PtySession {
     fn is_alive(&self) -> bool {
-        match self.child.lock().map(|mut c| c.try_wait()) {
-            Ok(Ok(Some(_))) => false,
-            Ok(Ok(None)) => true,
-            _ => false,
-        }
+        shell_alive(&self.io)
     }
 }
 
 impl Drop for PtySession {
     fn drop(&mut self) {
-        if let Ok(mut child) = self.child.lock() {
-            let _ = portable_pty::ChildKiller::kill(&mut **child);
-        }
+        kill_shell(&self.io);
     }
+}
+
+/// Handles from spawning the shell process; the caller wires reader threads.
+struct ShellHandles {
+    writer: Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>,
+    io: ShellIo,
+    /// One reader per output stream (pty master on Unix; stdout+stderr on
+    /// Windows pipes). Each is pumped into the OutputBuffer by a thread.
+    readers: Vec<Box<dyn std::io::Read + Send>>,
+}
+
+fn home_dir() -> String {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".into())
+}
+
+#[cfg(not(windows))]
+fn spawn_shell() -> PtyResult<ShellHandles> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 30,
+            cols: 110,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("openpty: {e}"))?;
+    let mut cmd = CommandBuilder::new("bash");
+    // arg returns (); chain as statements.
+    cmd.arg("--norc");
+    cmd.arg("--noprofile");
+    cmd.env("BRIDGE_PTY", "1");
+    cmd.cwd(home_dir());
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("spawn bash: {e}"))?;
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("clone reader: {e}"))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("take writer: {e}"))?;
+    Ok(ShellHandles {
+        writer: Arc::new(std::sync::Mutex::new(writer)),
+        io: ShellIo::Pty { child: std::sync::Mutex::new(child) },
+        readers: vec![Box::new(reader)],
+    })
+}
+
+#[cfg(windows)]
+fn spawn_shell() -> PtyResult<ShellHandles> {
+    // cmd /q: echo off — no prompt, no command echo; output is command
+    // results only. State (cwd, `set` vars) persists in the live process.
+    let mut child = StdCommand::new("cmd")
+        .args(["/q"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .current_dir(home_dir())
+        .env("BRIDGE_PTY", "1")
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|e| format!("spawn cmd: {e}"))?;
+    let stdin = child.stdin.take().ok_or_else(|| "spawn cmd: no stdin".to_string())?;
+    let stdout = child.stdout.take().ok_or_else(|| "spawn cmd: no stdout".to_string())?;
+    let stderr = child.stderr.take().ok_or_else(|| "spawn cmd: no stderr".to_string())?;
+    Ok(ShellHandles {
+        writer: Arc::new(std::sync::Mutex::new(Box::new(stdin))),
+        io: ShellIo::Pipes { child: std::sync::Mutex::new(child) },
+        readers: vec![Box::new(stdout), Box::new(stderr)],
+    })
 }
 
 // ─── Engine ──────────────────────────────────────────────────────────────────
@@ -224,19 +372,8 @@ impl PtyEngine {
         }
     }
 
-    fn shell_program() -> &'static str {
-        // Windows: cmd.exe, not PowerShell. PSReadLine + ConPTY on runners is
-        // fragile (slow boot, process dying at spawn); cmd is the first-class
-        // ConPTY citizen. cwd/env/state persist identically.
-        if cfg!(windows) {
-            "cmd"
-        } else {
-            "bash"
-        }
-    }
-
     fn eol() -> &'static str {
-        // ConPTY consumers (cmd/PowerShell) need CRLF; Unix shells want LF.
+        // cmd's stdin wants CRLF; POSIX shells want LF.
         if cfg!(windows) {
             "\r\n"
         } else {
@@ -260,107 +397,68 @@ impl PtyEngine {
                 return Ok(existing.clone());
             }
         }
-        // Create outside the map lock: PTY spawn can block briefly.
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 30,
-                cols: 110,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| format!("openpty: {e}"))?;
-        let mut cmd = CommandBuilder::new(Self::shell_program());
-        if !cfg!(windows) {
-            // arg returns (); chain as statements.
-            cmd.arg("--norc");
-            cmd.arg("--noprofile");
-        }
-        cmd.env("BRIDGE_PTY", "1");
-        cmd.cwd(
-            std::env::var("HOME")
-                .or_else(|_| std::env::var("USERPROFILE"))
-                .unwrap_or_else(|_| ".".into()),
-        );
-        let mut child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| format!("spawn {}: {e}", Self::shell_program()))?;
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| format!("clone reader: {e}"))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| format!("take writer: {e}"))?;
-        let writer = Arc::new(std::sync::Mutex::new(writer));
+        // Create outside the map lock: spawning can block briefly.
+        let handles = spawn_shell()?;
 
         let output = Arc::new(OutputBuffer::default());
-        let output_reader = output.clone();
-        let writer_reader = writer.clone();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 8192];
-            let mut lost = false;
-            // Carry-over so an escape sequence split across reads is still
-            // recognized (the DSR needle is 4 bytes; 8 is plenty).
-            let mut tail: Vec<u8> = Vec::new();
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break, // EOF: shell closed
-                    Ok(n) => {
-                        let mut combined = std::mem::take(&mut tail);
-                        combined.extend_from_slice(&buf[..n]);
-                        // ConPTY asks the terminal for the cursor position
-                        // (DSR 6n) and blocks the first paint until it gets an
-                        // answer. A real terminal replies; so do we: row 1,
-                        // col 1. Without this, cmd.exe under ConPTY hangs and
-                        // the first command is swallowed (observed on CI).
-                        if combined.windows(4).any(|w| w == b"\x1b[6n") {
-                            if let Ok(mut w) = writer_reader.lock() {
-                                let _ = std::io::Write::write_all(&mut *w, b"\x1b[1;1R");
-                                let _ = std::io::Write::flush(&mut *w);
+        for reader in handles.readers {
+            let output_reader = output.clone();
+            std::thread::spawn(move || {
+                let mut reader = reader;
+                let mut buf = [0u8; 8192];
+                let mut lost = false;
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break, // EOF: shell closed the stream
+                        Ok(n) => {
+                            let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                            output_reader.push(&chunk);
+                        }
+                        Err(_) => {
+                            if lost {
+                                break;
                             }
+                            lost = true; // one retry on transient EINTR-ish errors
                         }
-                        let keep = combined.len().saturating_sub(8);
-                        tail = combined[keep..].to_vec();
-                        let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
-                        output_reader.push(&chunk);
-                    }
-                    Err(_) => {
-                        if lost {
-                            break;
-                        }
-                        lost = true; // one retry on transient EINTR-ish errors
                     }
                 }
-            }
-        });
+            });
+        }
 
-        // Wait for the shell to paint its prompt (or die) before the first
-        // write: slow-starting shells on CI/Windows would otherwise swallow
-        // the first command into the void. Bounded; then discard the banner
-        // so the first `run` returns only the command's own output.
+        // Boot handshake: prove the shell reads stdin and executes commands
+        // by having it echo a fixed marker. No prompt parsing, no sleeps.
+        {
+            let mut writer = handles.writer.lock().unwrap();
+            std::io::Write::write_all(
+                &mut *writer,
+                format!("echo {BOOT_MARKER}{}", Self::eol()).as_bytes(),
+            )
+            .map_err(|e| format!("write: {e}"))?;
+            std::io::Write::flush(&mut *writer).map_err(|e| format!("flush: {e}"))?;
+        }
         let start = std::time::Instant::now();
-        while !output.pending() && start.elapsed() < std::time::Duration::from_secs(3) {
-            // Shell died while booting: no point waiting for a prompt.
-            match child.try_wait() {
-                Ok(Some(_)) | Err(_) => break,
-                Ok(None) => {}
+        loop {
+            if !shell_alive(&handles.io) {
+                return Err(
+                    "spawn shell: process exited immediately (unavailable or crashed)".into(),
+                );
+            }
+            if output.contains(BOOT_MARKER) {
+                break;
+            }
+            if start.elapsed() >= std::time::Duration::from_millis(BOOT_TIMEOUT_MS) {
+                kill_shell(&handles.io);
+                return Err("spawn shell: boot handshake timed out".into());
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+        // Discard banner + handshake so the first `run` returns only the
+        // command's own output.
         let _ = output.drain();
-        if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
-            return Err(format!(
-                "spawn {}: shell exited immediately (unavailable or crashed); retry later",
-                Self::shell_program()
-            ));
-        }
 
         let entry = Arc::new(PtySession {
-            writer,
-            child: std::sync::Mutex::new(child),
+            writer: handles.writer,
+            io: handles.io,
             output,
         });
         let mut sessions = self.sessions.lock().await;
@@ -469,10 +567,7 @@ impl PtyEngine {
                 let _ = std::io::Write::write_all(&mut *writer, format!("exit{}", Self::eol()).as_bytes());
                 let _ = std::io::Write::flush(&mut *writer);
             }
-            let _ = shell
-                .child
-                .lock()
-                .map(|mut c| portable_pty::ChildKiller::kill(&mut **c));
+            kill_shell(&shell.io);
             Ok(PtyResultPayload::Exit { session, exited: true })
         } else {
             Ok(PtyResultPayload::Exit { session, exited: false })
