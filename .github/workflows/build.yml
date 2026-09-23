@@ -138,7 +138,7 @@ jobs:
           Priority: optional
           Architecture: ${debarch}
           Maintainer: SynthHires <hi@synthhires.com>
-          Depends: libc6, libglib2.0-0, libgtk-3-0
+          Depends: libc6, libglib2.0-0, libgtk-3-0, libdbus-1-3, libsecret-1-0, libxdo3, libayatana-appindicator3-1
           Description: SynthHires Desktop Daemon
            Bridges the AI agent to your PC's filesystem and terminal
            over a single encrypted outbound tunnel.
@@ -189,6 +189,10 @@ jobs:
           done
       - name: Build AppImage (x64)
         run: |
+          # linuxdeploy bundles the binary's shared-library deps (libxdo,
+          # gtk, dbus, secret…) from the runner; the packaging job otherwise
+          # has none of the runtime libs the GUI links against.
+          sudo apt-get update && sudo apt-get install -y libxdo3 libglib2.0-0 libgtk-3-0 libdbus-1-3 libsecret-1-0 libayatana-appindicator3-1
           curl -sL -o linuxdeploy.AppImage "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
           chmod +x linuxdeploy.AppImage
           mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
