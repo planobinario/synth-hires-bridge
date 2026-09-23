@@ -149,7 +149,9 @@ jobs:
         run: |
           sudo apt-get install -y rpm
           V="${{ steps.ver.outputs.version }}"
-          for pair in "x86_64:x64" "aarch64:arm64"; do
+          # x64 only here; the arm64 rpm is built natively in
+          # package-linux-arm (rpmbuild refuses non-host architectures).
+          for pair in "x86_64:x64"; do
             rarch="${pair%%:*}"; tag="${pair##*:}"
             topdir="$HOME/rpmbuild-${tag}"
             mkdir -p "$topdir"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
@@ -219,8 +221,69 @@ jobs:
             synthhires-bridge-linux-x64.deb
             synthhires-bridge-linux-arm64.deb
             synthhires-bridge-linux-x64.rpm
-            synthhires-bridge-linux-arm64.rpm
             synthhires-bridge-linux-x64.AppImage
+
+  # ── 2b. ARM64 rpm packaging (rpmbuild refuses non-host archs) ─────────────
+  package-linux-arm:
+    needs: binaries
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract version
+        id: ver
+        run: echo "version=$(grep -m1 '^version' apps/desktop-daemon/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" >> "$GITHUB_OUTPUT"
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: bins
+      - name: Stage tarball
+        run: |
+          chmod +x bins/synthhires-bridge-linux-arm64/synthhires-bridge-linux-arm64
+          mkdir -p rpmroot/usr/bin
+          cp bins/synthhires-bridge-linux-arm64/synthhires-bridge-linux-arm64 rpmroot/usr/bin/synthhires-bridge
+          tar -C rpmroot -czf synthhires-bridge-arm64.tar.gz usr
+      - name: Build .rpm package (rpmbuild)
+        run: |
+          sudo apt-get update && sudo apt-get install -y rpm
+          V="${{ steps.ver.outputs.version }}"
+          topdir="$HOME/rpmbuild-arm64"
+          mkdir -p "$topdir"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          cp synthhires-bridge-arm64.tar.gz "$topdir/SOURCES/"
+          cat > "$topdir/SPECS/synthhires-bridge.spec" <<EOF
+          Name:           synthhires-bridge
+          Version:        ${V}
+          Release:        1%{?dist}
+          Summary:        SynthHires Desktop Daemon
+          License:        MIT
+          URL:            https://github.com/planobinario/synthhires-bridge
+          Source0:        synthhires-bridge-arm64.tar.gz
+          BuildArch:      aarch64
+
+          %description
+          Bridges the AI agent to your PC's filesystem and terminal over a
+          single encrypted outbound tunnel.
+
+          %prep
+          # tarball has no top-level dir (contains usr/ directly); -c creates
+          # %{name}-%{version}, cds into it and untars inside.
+          %setup -q -c
+
+          %install
+          mkdir -p %{buildroot}/usr
+          cp -r usr %{buildroot}/
+
+          %files
+          /usr/bin/synthhires-bridge
+
+          %changelog
+          EOF
+          rpmbuild -bb --define "_topdir $topdir" "$topdir/SPECS/synthhires-bridge.spec"
+          find "$topdir/RPMS" -name "*.rpm" -exec cp {} synthhires-bridge-linux-arm64.rpm \;
+      - name: Upload ARM64 rpm
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages-arm64-rpm
+          path: synthhires-bridge-linux-arm64.rpm
 
   # ── 3. macOS universal (lipo) ─────────────────────────────────────────────
   macos-universal:
@@ -265,7 +328,7 @@ jobs:
 
   # ── 5. Publish: tag release or rolling `edge` ─────────────────────────────
   publish:
-    needs: [binaries, package-linux, macos-universal, nix-build]
+    needs: [binaries, package-linux, package-linux-arm, macos-universal, nix-build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -288,6 +351,7 @@ jobs:
           cp artifacts/synthhires-bridge-linux-x64/synthhires-bridge-linux-x64 release_assets/synthhires-bridge-linux
           # Packages
           cp artifacts/linux-packages/* release_assets/
+          cp artifacts/linux-packages-arm64-rpm/synthhires-bridge-linux-arm64.rpm release_assets/
           ls -la release_assets/
       - name: Publish to rolling `edge` release
         if: github.ref == 'refs/heads/main'
