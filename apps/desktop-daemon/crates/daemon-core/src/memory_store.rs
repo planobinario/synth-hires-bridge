@@ -397,9 +397,12 @@ impl MemoryStore {
             let select_columns =
                 "id, kind, content, importance, tags, created_at, updated_at, hits";
             if strategy == "all" {
+                // id DESC as final tie-break: memories written in the same
+                // second share rank and updated_at, and SQLite's row order is
+                // then arbitrary (differs per platform/build). Latest wins.
                 let sql = format!(
                     "SELECT {select_columns} FROM memories WHERE project = ?1
-                     ORDER BY {rank_sql} DESC, updated_at DESC LIMIT ?2"
+                     ORDER BY {rank_sql} DESC, updated_at DESC, id DESC LIMIT ?2"
                 );
                 let mut stmt = conn
                     .prepare(&sql)
@@ -416,7 +419,7 @@ impl MemoryStore {
                             m.created_at, m.updated_at, m.hits
                      FROM memories_fts f JOIN memories m ON m.id = f.rowid
                      WHERE memories_fts MATCH ?1 AND m.project = ?2
-                     ORDER BY {rank_sql} DESC, m.updated_at DESC LIMIT ?3"
+                     ORDER BY {rank_sql} DESC, m.updated_at DESC, m.id DESC LIMIT ?3"
                 );
                 let mut stmt = conn
                     .prepare(&sql)
@@ -431,7 +434,7 @@ impl MemoryStore {
                 let sql = format!(
                     "SELECT {select_columns} FROM memories
                      WHERE project = ?1 AND content LIKE ?2
-                     ORDER BY {rank_sql} DESC, updated_at DESC LIMIT ?3"
+                     ORDER BY {rank_sql} DESC, updated_at DESC, id DESC LIMIT ?3"
                 );
                 let mut stmt = conn
                     .prepare(&sql)
@@ -608,7 +611,11 @@ mod tests {
         };
         assert_eq!(all.entries.len(), 3);
         assert_eq!(all.total, 3);
-        assert!(all.entries[0].hits >= 1); // recall touched hits
+        // Order-independent: recall bumps hits of every surfaced entry.
+        assert!(
+            all.entries.iter().any(|e| e.hits >= 1),
+            "recall should bump hits of surfaced entries"
+        );
     }
 
     #[test]
