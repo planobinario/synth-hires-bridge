@@ -62,7 +62,37 @@ pub enum DapOp {
     /// Pause a running thread.
     Pause { session: String, #[serde(default)] thread_id: Option<u64> },
     /// Evaluate an expression in the current frame (repl context).
-    Eval { session: String, expression: String, #[serde(default)] frame_id: Option<u64> },
+    Eval {
+        session: String,
+        expression: String,
+        #[serde(default)]
+        frame_id: Option<u64>,
+        /// Presentation hint for the adapter (DAP ValueFormat): "hex", or a
+        /// raw object for adapter-specific hints — forwarded verbatim.
+        #[serde(default)]
+        format: Option<Value>,
+    },
+    /// Write into a variable of the current frame (or any scope handle).
+    SetVariable {
+        session: String,
+        /// Scope handle: a `variablesReference` from variables/scopes/eval.
+        variables_reference: u64,
+        name: String,
+        value: String,
+        #[serde(default)]
+        format: Option<Value>,
+    },
+    /// Raw source text of a stack frame's file (optionally range-limited).
+    Source {
+        session: String,
+        /// Source reference from a stack frame (adapter-assigned).
+        source_reference: u64,
+        /// [lineStart, lineEnd] (1-based, per DAP SourceArguments).
+        #[serde(default)]
+        lines: Option<(u32, u32)>,
+    },
+    /// List live debug sessions (the engine is multi-debuggee by name).
+    Sessions,
     /// Threads of the debuggee.
     Threads { session: String },
     /// Recent debug events (stopped/output) drained from the ring.
@@ -418,22 +448,73 @@ impl DapEngine {
                 c.request("pause", serde_json::json!({"threadId": tid}), REQ_TIMEOUT).await?;
                 Ok(serde_json::json!({ "session": session, "paused": tid }))
             }
-            DapOp::Eval { session, expression, frame_id } => {
+            DapOp::Eval { session, expression, frame_id, format } => {
                 self.gate_shell().await?;
                 let c = self.get(&session).await?;
                 let frame = frame_id.or(self.run_state_of(&c).frame);
-                let body = c
-                    .request(
-                        "evaluate",
-                        serde_json::json!({"expression": expression, "frameId": frame, "context": "repl"}),
-                        REQ_TIMEOUT,
-                    )
-                    .await?;
+                let mut args = serde_json::json!({
+                    "expression": expression,
+                    "frameId": frame,
+                    "context": "repl",
+                });
+                if let Some(f) = value_format(format)? {
+                    args["format"] = f;
+                }
+                let body = c.request("evaluate", args, REQ_TIMEOUT).await?;
+                // Surface the full evaluation result: variablesReference lets
+                // the agent drill into struct results; memoryReference marks
+                // pointer results.
                 Ok(serde_json::json!({
                     "session": session,
                     "result": body.get("result").cloned().unwrap_or(Value::Null),
                     "type": body.get("type").cloned().unwrap_or(Value::Null),
+                    "variablesReference": body.get("variablesReference").cloned().unwrap_or(Value::Null),
+                    "memoryReference": body.get("memoryReference").cloned().unwrap_or(Value::Null),
+                    "namedVariables": body.get("namedVariables").cloned().unwrap_or(Value::Null),
+                    "indexedVariables": body.get("indexedVariables").cloned().unwrap_or(Value::Null),
                 }))
+            }
+            DapOp::SetVariable { session, variables_reference, name, value, format } => {
+                self.gate_shell().await?;
+                let c = self.get(&session).await?;
+                let mut args = serde_json::json!({
+                    "variablesReference": variables_reference,
+                    "name": name,
+                    "value": value,
+                });
+                if let Some(f) = format {
+                    args["format"] = f;
+                }
+                let body = c.request("setVariable", args, REQ_TIMEOUT).await?;
+                Ok(serde_json::json!({
+                    "session": session,
+                    "name": name,
+                    "value": body.get("value").cloned().unwrap_or(Value::Null),
+                    "type": body.get("type").cloned().unwrap_or(Value::Null),
+                    "namedVariables": body.get("namedVariables").cloned().unwrap_or(Value::Null),
+                    "indexedVariables": body.get("indexedVariables").cloned().unwrap_or(Value::Null),
+                }))
+            }
+            DapOp::Source { session, source_reference, lines } => {
+                let c = self.get(&session).await?;
+                let mut args = serde_json::json!({ "sourceReference": source_reference });
+                if let Some((start, end)) = lines {
+                    args["lineStart"] = serde_json::json!(start);
+                    args["lineEnd"] = serde_json::json!(end);
+                }
+                let body = c.request("source", args, REQ_TIMEOUT).await?;
+                Ok(serde_json::json!({
+                    "session": session,
+                    "content": body.get("content").cloned().unwrap_or(Value::Null),
+                    "mimeType": body.get("mimeType").cloned().unwrap_or(Value::Null),
+                }))
+            }
+            DapOp::Sessions => {
+                let names: Vec<String> = {
+                    let map = self.sessions.lock().await;
+                    map.keys().cloned().collect()
+                };
+                Ok(serde_json::json!({ "sessions": names }))
             }
             DapOp::Threads { session } => {
                 let c = self.get(&session).await?;
@@ -536,6 +617,24 @@ impl DapEngine {
 }
 
 // ─── DAP framing helpers (same base protocol as LSP, unit-tested) ──────────
+
+/// Resolve a wire `format` hint into a DAP ValueFormat value: only `hex` is
+/// standard; anything else must be an explicit object (adapter-specific) —
+/// never invented here. Pure, so the contract is unit-testable without a
+/// live adapter.
+fn value_format(format: Option<Value>) -> DapResult<Option<Value>> {
+    match format {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s == "hex" => Ok(Some(serde_json::json!({ "hex": true }))),
+        Some(Value::String(s)) => Err(format!(
+            "unknown format '{s}' (try \"hex\" or a ValueFormat object)"
+        )),
+        Some(obj @ Value::Object(_)) => Ok(Some(obj)),
+        Some(other) => Err(format!(
+            "format must be \"hex\" or a ValueFormat object, got: {other}"
+        )),
+    }
+}
 
 /// Frame a DAP message exactly like the LSP base protocol requires.
 pub fn dap_frame(body: &str) -> Vec<u8> {
@@ -658,8 +757,48 @@ mod tests {
         .unwrap();
         assert!(matches!(bp, DapOp::SetBreakpoints { lines, .. } if lines.len() == 2));
 
+        let ev: DapOp = serde_json::from_value(json!({
+            "op": "eval", "session": "s1", "expression": "len(x)", "format": {"hex": true},
+        }))
+        .unwrap();
+        assert!(matches!(ev, DapOp::Eval { format: Some(ref f), .. } if f.get("hex") == Some(&json!(true))));
+
+        let sv: DapOp = serde_json::from_value(json!({
+            "op": "setVariable", "session": "s1", "variablesReference": 1003,
+            "name": "x", "value": "42",
+        }))
+        .unwrap();
+        assert!(matches!(
+            sv,
+            DapOp::SetVariable { variables_reference: 1003, ref name, ref value, .. }
+                if name == "x" && value == "42"
+        ));
+
+        let src: DapOp = serde_json::from_value(json!({
+            "op": "source", "session": "s1", "sourceReference": 7, "lines": [10, 20],
+        }))
+        .unwrap();
+        assert!(matches!(
+            src,
+            DapOp::Source { source_reference: 7, lines: Some((10, 20)), .. }
+        ));
+
+        let ss: DapOp = serde_json::from_value(json!({ "op": "sessions" })).unwrap();
+        assert!(matches!(ss, DapOp::Sessions));
+
         let step: DapOp = serde_json::from_value(json!({ "op": "step", "session": "s1", "action": "in" })).unwrap();
         assert!(matches!(step, DapOp::Step { action: Some(ref a), .. } if a == "in"));
+    }
+
+    #[test]
+    fn value_format_honors_the_dap_contract() {
+        assert_eq!(value_format(None).unwrap(), None);
+        assert_eq!(value_format(Some(json!(null))).unwrap(), None);
+        assert_eq!(value_format(Some(json!("hex"))).unwrap(), Some(json!({"hex": true})));
+        let obj = json!({"hex": true, "lazy": true});
+        assert_eq!(value_format(Some(obj.clone())).unwrap(), Some(obj));
+        assert!(value_format(Some(json!("rainbow"))).unwrap_err().contains("unknown format"));
+        assert!(value_format(Some(json!(42))).unwrap_err().contains("ValueFormat"));
     }
 }
 

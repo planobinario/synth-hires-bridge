@@ -29,6 +29,53 @@ use uuid::Uuid;
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// Canonical dispatch arm: parse params → run op → serialize → respond.
+///
+/// `$value`/`$req` are caller-chosen binding names (macro hygiene: bindings
+/// created inside a macro are invisible to the passed block). `$run` is the
+/// async op body; it must evaluate to `Result<impl Serialize, E: Display>`.
+/// The macro owns the boilerplate: param-parse errors, `send_action_result`
+/// with the canonical ok=true/None pairing, and `send_error` on op failure.
+/// Arms with non-standard contracts (streaming shell, eval's JS-error
+/// transport, verified-write flags, memory's blocking worker) stay hand-written.
+macro_rules! dispatch_op {
+    ($self:ident, $ws:ident, $request:ident, $started:ident, $value:ident, $req:ident, $param_ty:ty, $run:block) => {{
+        let parsed = serde_json::from_value::<$param_ty>($request.params.clone());
+        match parsed {
+            Ok($value) => {
+                // Most arms don't need the request — the lint is silenced per
+                // binding, not per arm, so every arm stays symmetric.
+                #[allow(unused_variables)]
+                let $req = &$request;
+                let result = async move {
+                    $run
+                }
+                .await;
+                match result {
+                    Ok(ok) => {
+                        $self
+                            .send_action_result(
+                                $ws,
+                                $request.id.clone(),
+                                true,
+                                Some(serde_json::to_value(&ok)?),
+                                None,
+                                elapsed_ms($started),
+                            )
+                            .await
+                    }
+                    Err(error) => $self.send_error($ws, $request.id.clone(), error.to_string()).await,
+                }
+            }
+            Err(error) => {
+                $self
+                    .send_error($ws, $request.id.clone(), format!("bad params: {error}"))
+                    .await
+            }
+        }
+    }};
+}
+
 pub struct WsClient {
     backend_url: String,
     token: String,
@@ -329,21 +376,14 @@ impl WsClient {
         let started = std::time::Instant::now();
         match request.capability.as_str() {
             "desktop.fs.read" => {
-                let parsed =
-                    serde_json::from_value::<crate::fs_ops::FsReadRequest>(request.params.clone());
-                match parsed {
-                    Ok(value) => {
-                        let annotate = value.annotate.unwrap_or(false);
-                        match self.path_gate(&request, "desktop.fs.read", &value.path).await {
-                            Ok(gate) => match crate::fs_ops::FsOps::new(&gate).read_annotated(value, annotate).await {
-                                Ok(result) => self.send_action_result(ws, request.id, true, Some(serde_json::json!({"content_base64": result.content_base64, "size": result.size})), None, elapsed_ms(started)).await,
-                                Err(error) => self.send_error(ws, request.id, error.to_string()).await,
-                            },
-                            Err(error) => self.send_error(ws, request.id, error.to_string()).await,
-                        }
-                    }
-                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
-                }
+                dispatch_op!(self, ws, request, started, value, req, crate::fs_ops::FsReadRequest, {
+                    let annotate = value.annotate.unwrap_or(false);
+                    let gate = self.path_gate(req, "desktop.fs.read", &value.path).await?;
+                    crate::fs_ops::FsOps::new(&gate)
+                        .read_annotated(value, annotate)
+                        .await
+                        .map(|r| serde_json::json!({"content_base64": r.content_base64, "size": r.size}))
+                })
             }
             "desktop.fs.patch" => {
                 let parsed =
@@ -384,29 +424,10 @@ impl WsClient {
                 }
             }
             "desktop.code.ast_grep" => {
-                let parsed = serde_json::from_value::<
-                    crate::ast_ops::AstGrepRequest,
-                >(request.params.clone());
-                match parsed {
-                    Ok(value) => {
-                        let gate = self.gate.lock().await.clone();
-                        match crate::ast_ops::AstOps::new(&gate).grep(value).await {
-                            Ok(result) => {
-                                self.send_action_result(
-                                    ws,
-                                    request.id,
-                                    true,
-                                    Some(serde_json::to_value(&result)?),
-                                    None,
-                                    elapsed_ms(started),
-                                )
-                                .await
-                            }
-                            Err(error) => self.send_error(ws, request.id, error.to_string()).await,
-                        }
-                    }
-                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
-                }
+                dispatch_op!(self, ws, request, started, value, req, crate::ast_ops::AstGrepRequest, {
+                    let gate = self.gate.lock().await.clone();
+                    crate::ast_ops::AstOps::new(&gate).grep(value).await
+                })
             }
             "desktop.code.ast_edit" => {
                 let parsed = serde_json::from_value::<
@@ -483,70 +504,19 @@ impl WsClient {
                 }
             }
             "desktop.lsp.diagnostics" => {
-                let parsed = serde_json::from_value::<crate::lsp_ops::LspFileRequest>(
-                    request.params.clone(),
-                );
-                match parsed {
-                    Ok(value) => match self.lsp.diagnostics(value).await {
-                        Ok(result) => {
-                            self.send_action_result(
-                                ws,
-                                request.id,
-                                true,
-                                Some(serde_json::to_value(&result)?),
-                                None,
-                                elapsed_ms(started),
-                            )
-                            .await
-                        }
-                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
-                    },
-                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
-                }
+                dispatch_op!(self, ws, request, started, value, req, crate::lsp_ops::LspFileRequest, {
+                    self.lsp.diagnostics(value).await
+                })
             }
             "desktop.lsp.hover" => {
-                let parsed = serde_json::from_value::<crate::lsp_ops::LspPositionRequest>(
-                    request.params.clone(),
-                );
-                match parsed {
-                    Ok(value) => match self.lsp.hover(value).await {
-                        Ok(result) => {
-                            self.send_action_result(
-                                ws,
-                                request.id,
-                                true,
-                                Some(serde_json::to_value(&result)?),
-                                None,
-                                elapsed_ms(started),
-                            )
-                            .await
-                        }
-                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
-                    },
-                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
-                }
+                dispatch_op!(self, ws, request, started, value, req, crate::lsp_ops::LspPositionRequest, {
+                    self.lsp.hover(value).await
+                })
             }
             "desktop.lsp.definition" => {
-                let parsed = serde_json::from_value::<crate::lsp_ops::LspPositionRequest>(
-                    request.params.clone(),
-                );
-                match parsed {
-                    Ok(value) => match self.lsp.definition(value).await {
-                        Ok(result) => {
-                            self.send_action_result(
-                                ws,
-                                request.id,
-                                true,
-                                Some(serde_json::to_value(&result)?),
-                                None,
-                                elapsed_ms(started),
-                            )
-                            .await
-                        }
-                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
-                    },
-                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
-                }
+                dispatch_op!(self, ws, request, started, value, req, crate::lsp_ops::LspPositionRequest, {
+                    self.lsp.definition(value).await
+                })
             }
             "desktop.lsp.rename" => {
                 let parsed = serde_json::from_value::<crate::lsp_ops::LspRenameRequest>(
@@ -609,270 +579,66 @@ impl WsClient {
                 }
             }
             "desktop.proc.op" => {
-                let parsed =
-                    serde_json::from_value::<crate::proc_ops::ProcOp>(request.params.clone());
-                match parsed {
-                    Ok(value) => match self.proc.execute(value).await {
-                        Ok(result) => {
-                            self.send_action_result(
-                                ws,
-                                request.id,
-                                true,
-                                Some(serde_json::to_value(&result)?),
-                                None,
-                                elapsed_ms(started),
-                            )
-                            .await
-                        }
-                        Err(error) => self.send_error(ws, request.id, error).await,
-                    },
-                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
-                }
+                dispatch_op!(self, ws, request, started, value, req, crate::proc_ops::ProcOp, {
+                    self.proc.execute(value).await
+                })
             }
             "desktop.pty.op" => {
-                let parsed =
-                    serde_json::from_value::<crate::pty_ops::PtyOp>(request.params.clone());
-                match parsed {
-                    Ok(value) => match self.pty.execute(value).await {
-                        Ok(result) => {
-                            self.send_action_result(
-                                ws,
-                                request.id,
-                                true,
-                                Some(serde_json::to_value(&result)?),
-                                None,
-                                elapsed_ms(started),
-                            )
-                            .await
-                        }
-                        Err(error) => self.send_error(ws, request.id, error).await,
-                    },
-                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
-                }
+                dispatch_op!(self, ws, request, started, value, req, crate::pty_ops::PtyOp, {
+                    self.pty.execute(value).await
+                })
             }
             "desktop.browser.launch" => {
-                let parsed = serde_json::from_value::<crate::browser_ops::BrowserLaunchParams>(
-                    request.params.clone(),
-                );
-                match parsed {
-                    Ok(value) => match self.browser.launch(value).await {
-                        Ok(result) => {
-                            self.send_action_result(
-                                ws,
-                                request.id,
-                                true,
-                                Some(serde_json::to_value(&result)?),
-                                None,
-                                elapsed_ms(started),
-                            )
-                            .await
-                        }
-                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
-                    },
-                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
-                }
+                dispatch_op!(self, ws, request, started, value, req, crate::browser_ops::BrowserLaunchParams, {
+                    self.browser.launch(value).await
+                })
             }
             "desktop.browser.nav" => {
-                let parsed = serde_json::from_value::<crate::browser_ops::BrowserNavigateParams>(
-                    request.params.clone(),
-                );
-                match parsed {
-                    Ok(value) => match self.browser.navigate(value).await {
-                        Ok(result) => {
-                            self.send_action_result(
-                                ws,
-                                request.id,
-                                true,
-                                Some(serde_json::to_value(&result)?),
-                                None,
-                                elapsed_ms(started),
-                            )
-                            .await
-                        }
-                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
-                    },
-                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
-                }
+                dispatch_op!(self, ws, request, started, value, req, crate::browser_ops::BrowserNavigateParams, {
+                    self.browser.navigate(value).await
+                })
             }
             "desktop.browser.snapshot" => {
-                let parsed = serde_json::from_value::<crate::browser_ops::SnapshotParams>(
-                    request.params.clone(),
-                );
-                match parsed {
-                    Ok(value) => match self.browser.snapshot(value).await {
-                        Ok(result) => {
-                            self.send_action_result(
-                                ws,
-                                request.id,
-                                true,
-                                Some(serde_json::to_value(&result)?),
-                                None,
-                                elapsed_ms(started),
-                            )
-                            .await
-                        }
-                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
-                    },
-                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
-                }
+                dispatch_op!(self, ws, request, started, value, req, crate::browser_ops::SnapshotParams, {
+                    self.browser.snapshot(value).await
+                })
             }
             "desktop.browser.act" => {
-                let parsed = serde_json::from_value::<crate::browser_ops::BrowserActParams>(
-                    request.params.clone(),
-                );
-                match parsed {
-                    Ok(value) => match self.browser.act(value).await {
-                        Ok(result) => {
-                            self.send_action_result(
-                                ws,
-                                request.id,
-                                true,
-                                Some(serde_json::to_value(&result)?),
-                                None,
-                                elapsed_ms(started),
-                            )
-                            .await
-                        }
-                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
-                    },
-                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
-                }
+                dispatch_op!(self, ws, request, started, value, req, crate::browser_ops::BrowserActParams, {
+                    self.browser.act(value).await
+                })
             }
             "desktop.browser.shot" => {
-                let parsed = serde_json::from_value::<crate::browser_ops::ScreenshotParams>(
-                    request.params.clone(),
-                );
-                match parsed {
-                    Ok(value) => match self.browser.screenshot(value).await {
-                        Ok(result) => {
-                            self.send_action_result(
-                                ws,
-                                request.id,
-                                true,
-                                Some(serde_json::to_value(&result)?),
-                                None,
-                                elapsed_ms(started),
-                            )
-                            .await
-                        }
-                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
-                    },
-                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
-                }
+                dispatch_op!(self, ws, request, started, value, req, crate::browser_ops::ScreenshotParams, {
+                    self.browser.screenshot(value).await
+                })
             }
             "desktop.browser.wait" => {
-                let parsed = serde_json::from_value::<crate::browser_ops::WaitParams>(
-                    request.params.clone(),
-                );
-                match parsed {
-                    Ok(value) => match self.browser.wait(value).await {
-                        Ok(result) => {
-                            self.send_action_result(
-                                ws,
-                                request.id,
-                                true,
-                                Some(serde_json::to_value(&result)?),
-                                None,
-                                elapsed_ms(started),
-                            )
-                            .await
-                        }
-                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
-                    },
-                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
-                }
+                dispatch_op!(self, ws, request, started, value, req, crate::browser_ops::WaitParams, {
+                    self.browser.wait(value).await
+                })
             }
             "desktop.debug.op" => {
-                let parsed = serde_json::from_value::<crate::dap_ops::DapOp>(request.params.clone());
-                match parsed {
-                    Ok(value) => match self.dap.execute(value).await {
-                        Ok(result) => {
-                            self.send_action_result(
-                                ws,
-                                request.id,
-                                true,
-                                Some(result),
-                                None,
-                                elapsed_ms(started),
-                            )
-                            .await
-                        }
-                        Err(error) => self.send_error(ws, request.id, error).await,
-                    },
-                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
-                }
+                dispatch_op!(self, ws, request, started, value, req, crate::dap_ops::DapOp, {
+                    self.dap.execute(value).await
+                })
             }
             "desktop.browser.close" => {
-                let parsed = serde_json::from_value::<crate::browser_ops::BrowserCloseParams>(
-                    request.params.clone(),
-                );
-                match parsed {
-                    Ok(value) => match self.browser.close(value.kill).await {
-                        Ok(result) => {
-                            self.send_action_result(
-                                ws,
-                                request.id,
-                                true,
-                                Some(serde_json::to_value(&result)?),
-                                None,
-                                elapsed_ms(started),
-                            )
-                            .await
-                        }
-                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
-                    },
-                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
-                }
+                dispatch_op!(self, ws, request, started, value, req, crate::browser_ops::BrowserCloseParams, {
+                    self.browser.close(value.kill).await
+                })
             }
             "desktop.git.overview" => {
-                let parsed = serde_json::from_value::<crate::git_ops::GitOverviewRequest>(
-                    request.params.clone(),
-                );
-                match parsed {
-                    Ok(value) => match crate::git_ops::GitOps::new(&*self.gate.lock().await)
+                dispatch_op!(self, ws, request, started, value, req, crate::git_ops::GitOverviewRequest, {
+                    crate::git_ops::GitOps::new(&*self.gate.lock().await)
                         .overview(value)
                         .await
-                    {
-                        Ok(result) => {
-                            self.send_action_result(
-                                ws,
-                                request.id,
-                                true,
-                                Some(serde_json::to_value(&result)?),
-                                None,
-                                elapsed_ms(started),
-                            )
-                            .await
-                        }
-                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
-                    },
-                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
-                }
+                })
             }
             "desktop.git.diff" => {
-                let parsed = serde_json::from_value::<crate::git_ops::GitDiffRequest>(
-                    request.params.clone(),
-                );
-                match parsed {
-                    Ok(value) => match crate::git_ops::GitOps::new(&*self.gate.lock().await)
-                        .diff(value)
-                        .await
-                    {
-                        Ok(result) => {
-                            self.send_action_result(
-                                ws,
-                                request.id,
-                                true,
-                                Some(serde_json::to_value(&result)?),
-                                None,
-                                elapsed_ms(started),
-                            )
-                            .await
-                        }
-                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
-                    },
-                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
-                }
+                dispatch_op!(self, ws, request, started, value, req, crate::git_ops::GitDiffRequest, {
+                    crate::git_ops::GitOps::new(&*self.gate.lock().await).diff(value).await
+                })
             }
             "desktop.fs.delete" => {
                 let parsed = serde_json::from_value::<crate::fs_ops::FsDeleteRequest>(
@@ -922,31 +688,10 @@ impl WsClient {
                 }
             }
             "desktop.fs.list" => {
-                let parsed =
-                    serde_json::from_value::<crate::fs_ops::FsListRequest>(request.params.clone());
-                match parsed {
-                    Ok(value) => {
-                        let gate = self.gate.lock().await.clone();
-                        match crate::fs_ops::FsOps::new(&gate).list(value).await {
-                            Ok(result) => {
-                                self.send_action_result(
-                                    ws,
-                                    request.id,
-                                    true,
-                                    Some(serde_json::to_value(result)?),
-                                    None,
-                                    elapsed_ms(started),
-                                )
-                                .await
-                            }
-                            Err(error) => self.send_error(ws, request.id, error.to_string()).await,
-                        }
-                    }
-                    Err(error) => {
-                        self.send_error(ws, request.id, format!("bad params: {error}"))
-                            .await
-                    }
-                }
+                dispatch_op!(self, ws, request, started, value, req, crate::fs_ops::FsListRequest, {
+                    let gate = self.gate.lock().await.clone();
+                    crate::fs_ops::FsOps::new(&gate).list(value).await
+                })
             }
             "desktop.fs.watch" => {
                 let parsed = serde_json::from_value::<FsWatchRequest>(request.params.clone());

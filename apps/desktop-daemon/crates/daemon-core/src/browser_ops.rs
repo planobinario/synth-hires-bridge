@@ -430,18 +430,27 @@ impl BrowserStore {
         };
 
         // Serialize nodes to JSON once — extraction becomes shape-safe.
+        let serialized: Vec<Value> = nodes
+            .iter()
+            .filter_map(|node| serde_json::to_value(node).ok())
+            .collect();
+
+        // Hierarchy pass: one O(n) sweep builds the parent maps, then a
+        // memoized climb yields the TRUE tree depth per node (real indent,
+        // not the old flat one-level heuristic).
+        let (by_id, by_child) = ax_parent_maps(&serialized);
+        let mut depth_cache: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut depth_of = |id: &str| ax_depth(id, &by_id, &by_child, &mut depth_cache);
+
         let mut refs = HashMap::new();
         let mut out = String::new();
         let mut count = 0usize;
         let total = nodes.len();
-        for node in nodes {
+        for v in &serialized {
             if count >= limit {
                 break;
             }
-            let v = match serde_json::to_value(node) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
             let ignored = v.get("ignored").and_then(Value::as_bool).unwrap_or(false);
             if ignored {
                 continue;
@@ -484,7 +493,7 @@ impl BrowserStore {
                 refs.insert(r, backend);
             }
 
-            let indent = "  ".repeat(node_depth(&v, &node_id));
+            let indent = "  ".repeat(depth_of(&node_id));
             let mut line = format!("{indent}[ref={r}] {role}");
             if !name.is_empty() {
                 line.push_str(&format!(" \"{name}\""));
@@ -919,21 +928,58 @@ fn ax_text(v: Option<&Value>) -> String {
     }
 }
 
-/// Tree depth of an AX node: walk `parent` chain is impossible (flat list), so
-/// derive indent from childIds membership: depth = number of ancestors. Cheap
-/// approximation: count how deep the node's id appears nested in other nodes'
-/// childIds (built once per snapshot by the caller loop — O(n²) worst case but
-/// n is capped at a few hundred).
+/// Parent maps for one AX tree: node-id → parent-id (from `parentId`) and
+/// child-id → parent-id (reverse of `childIds`). Two maps because CDP omits
+/// `parentId` on some nodes that still appear in a parent's `childIds`.
+/// (`std::collections::HashMap` spelled out: the import is feature-gated.)
 #[cfg_attr(not(feature = "browser"), allow(dead_code))]
-fn node_depth(node: &Value, _node_id: &str) -> usize {
-    // The full tree isn't available here; keep flat layout but mark roots.
-    // A cheap, stable heuristic: depth is provided implicitly by childIds of
-    // ancestors — instead we use `parentId` when present.
-    if node.get("parentId").and_then(Value::as_str).is_some() {
-        1
-    } else {
-        0
+fn ax_parent_maps(
+    nodes: &[Value],
+) -> (
+    std::collections::HashMap<&str, &str>,
+    std::collections::HashMap<&str, &str>,
+) {
+    let mut by_id: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::with_capacity(nodes.len());
+    let mut by_child: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::with_capacity(nodes.len() * 2);
+    for node in nodes {
+        let Some(id) = node.get("nodeId").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(parent) = node.get("parentId").and_then(Value::as_str) {
+            by_id.insert(id, parent);
+        }
+        if let Some(children) = node.get("childIds").and_then(Value::as_array) {
+            for child in children.iter().filter_map(Value::as_str) {
+                by_child.entry(child).or_insert(id);
+            }
+        }
     }
+    (by_id, by_child)
+}
+
+/// TRUE tree depth (root = 0) via memoized climb: the parent edge comes from
+/// `parentId` or the childIds reverse map. Memoization makes the whole
+/// snapshot's depth computation O(n) total. A missing/cyclic parent resolves
+/// to 0 instead of looping.
+#[cfg_attr(not(feature = "browser"), allow(dead_code))]
+fn ax_depth(
+    id: &str,
+    by_id: &std::collections::HashMap<&str, &str>,
+    by_child: &std::collections::HashMap<&str, &str>,
+    cache: &mut std::collections::HashMap<String, usize>,
+) -> usize {
+    if let Some(d) = cache.get(id) {
+        return *d;
+    }
+    let parent = by_id.get(id).or_else(|| by_child.get(id)).copied();
+    let depth = match parent {
+        Some(p) if p != id => ax_depth(p, by_id, by_child, cache) + 1,
+        _ => 0,
+    };
+    cache.insert(id.to_string(), depth);
+    depth
 }
 
 /// Center of the first usable quad. Quads arrive as arrays of 8 numbers
@@ -1069,6 +1115,28 @@ mod tests {
         assert!((y - 30.0).abs() < 1e-9);
         assert!(quad_center(&json!([])).is_none());
         assert!(quad_center(&json!([[1.0, 2.0]])).is_none());
+    }
+
+    #[test]
+    fn ax_depth_reconstructs_the_real_hierarchy() {
+        let tree = vec![
+            json!({"nodeId": "1", "childIds": ["2", "3"]}),
+            json!({"nodeId": "2", "parentId": "1", "childIds": ["4"]}),
+            json!({"nodeId": "3", "parentId": "1"}),
+            json!({"nodeId": "4", "childIds": ["5"]}), // parent only via childIds
+            json!({"nodeId": "5", "parentId": "4"}),
+            json!({"nodeId": "9"}), // detached root
+        ];
+        let (by_id, by_child) = ax_parent_maps(&tree);
+        let mut cache = std::collections::HashMap::new();
+        let mut d = |id: &str| ax_depth(id, &by_id, &by_child, &mut cache);
+        assert_eq!(d("1"), 0);
+        assert_eq!(d("2"), 1);
+        assert_eq!(d("3"), 1);
+        assert_eq!(d("4"), 2);
+        assert_eq!(d("5"), 3);
+        assert_eq!(d("9"), 0);
+        assert_eq!(d("missing"), 0);
     }
 
     #[test]
