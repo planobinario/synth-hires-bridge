@@ -124,7 +124,18 @@ impl CapabilityGate {
                         },
                     }
                 };
-                if self.path_matches_any(&real) {
+                // La ruta REAL debe vivir bajo un root permitido — comparada
+                // contra los prefixes léxicos Y su forma canónica: en macOS
+                // `/var -> /private/var` (el TMPDIR solo matchea canónicamente)
+                // y en Windows canonicalize devuelve paths verbatim `\\?\C:\`.
+                // Aprobar un root que es symlink aprueba su contenido real.
+                let canonically_allowed = self
+                    .snapshot
+                    .always_allow_paths
+                    .iter()
+                    .filter_map(|p| std::fs::canonicalize(p).ok())
+                    .any(|cp| real.starts_with(cp));
+                if self.path_matches_any(&real) || canonically_allowed {
                     Ok(GateDecision::Allow)
                 } else {
                     tracing::warn!(
@@ -222,10 +233,19 @@ mod tests {
         let outside = std::env::temp_dir().join(format!("sh-gate-out-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
+        // Windows runners sin privilegio de symlink: la prueba se salta
+        // (la semántica que protege está cubierta en Unix).
+        let link = dir.join("link");
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
+        if std::os::unix::fs::symlink(&outside, &link).is_err() {
+            eprintln!("skipping: symlink unavailable");
+            return;
+        }
         #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&outside, dir.join("link")).unwrap();
+        if std::os::windows::fs::symlink_dir(&outside, &link).is_err() {
+            eprintln!("skipping: symlink privilege unavailable");
+            return;
+        }
 
         let g = gate_with_paths(&[dir.to_str().unwrap()]);
         // Léxico:Allow (la ruta pasa por dentro del root)…
