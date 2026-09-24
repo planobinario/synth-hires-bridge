@@ -328,7 +328,12 @@ impl BrowserStore {
             .source(POPUP_GUARD_JS)
             .build()
             .map_err(|e| BrowserError::Cdp(format!("popup guard: {e}")))?;
-        let _ = page.execute(popup_guard).await;
+        // STRICT: if the injection fails, the popup policy is silently gone
+        // and the agent would act without knowing. Better a loud launch
+        // failure than a silent capability loss.
+        page.execute(popup_guard)
+            .await
+            .map_err(|e| BrowserError::Cdp(format!("popup guard inject: {e}")))?;
 
         // Seed the shared registry so the browser is visible in the desktop UI.
         let task_id = uuid::Uuid::new_v4();
@@ -937,10 +942,13 @@ fn console_args_text(ev: &Value) -> String {
 /// Injected on every new document: route `window.open` to the SAME tab so
 /// `target=_blank` links stay inside the session's tracked page instead of
 /// spawning untracked popups (the agent would keep acting on a stale tab).
-/// Real navigation, so `beforeunload` handlers still get to run; returning
-/// `null` matches the spec for a blocked popup.
+/// Anchors with `target="_blank"` are captured on click (capture phase) and
+/// turned into same-tab navigations — their activation bypasses
+/// `window.open` entirely (confirmed by the live E2E in
+/// `tests/browser_live.rs`). Real navigation, so `beforeunload` handlers
+/// still get to run; returning `null` matches the spec for a blocked popup.
 #[cfg(feature = "browser")]
-const POPUP_GUARD_JS: &str = r"(() => {
+const POPUP_GUARD_JS: &str = r#"(() => {
   const realOpen = window.open.bind(window);
   window.open = (url, target, features) => {
     try {
@@ -951,7 +959,21 @@ const POPUP_GUARD_JS: &str = r"(() => {
       return realOpen(url, target, features);
     }
   };
-})();";
+  // Anchor target=_blank is NOT routed through window.open — the browser
+  // process performs the activation. Capture the click before the page and
+  // turn the anchor into a same-tab navigation instead.
+  document.addEventListener('click', (e) => {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+    const a = e.target && e.target.closest ? e.target.closest('a[target="_blank"]') : null;
+    if (!a) return;
+    try {
+      const abs = new URL(a.getAttribute('href') || '', location.href).href;
+      if (abs === location.href) { e.preventDefault(); return; }
+      e.preventDefault();
+      location.href = abs;
+    } catch {}
+  }, true);
+})();"#;
 
 /// Auto-dismiss JS dialogs. `accept=false` maps to: confirm → cancel,
 /// prompt → null, beforeunload → stay on the page — the safe default in
@@ -1249,10 +1271,13 @@ mod tests {
     #[test]
     fn popup_guard_js_overrides_window_open_same_tab() {
         // Shape contract: an IIFE that overrides window.open, resolves the
-        // URL against the current document and navigates THIS tab.
+        // URL against the current document and navigates THIS tab — plus
+        // the capture-phase anchor interception (live-E2E proven gap).
         assert!(POPUP_GUARD_JS.contains("window.open ="));
         assert!(POPUP_GUARD_JS.contains("new URL(url, location.href)"));
         assert!(POPUP_GUARD_JS.contains("location.href = abs"));
+        assert!(POPUP_GUARD_JS.contains("a[target=\"_blank\"]"));
+        assert!(POPUP_GUARD_JS.contains("true)")); // capture-phase listener
     }
 
     #[cfg(feature = "browser")]
