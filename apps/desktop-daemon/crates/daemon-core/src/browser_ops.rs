@@ -35,7 +35,10 @@ use chromiumoxide::{
             DispatchMouseEventType, InsertTextParams, MouseButton,
         },
         log::{EnableParams as LogEnable, EventEntryAdded},
-        page::CaptureScreenshotFormat,
+        page::{
+            AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat,
+            EventJavascriptDialogOpening, HandleJavaScriptDialogParams,
+        },
     },
     cdp::js_protocol::runtime::{EnableParams as RuntimeEnable, EventConsoleApiCalled},
     detection::{default_executable, DetectionOptions},
@@ -234,6 +237,8 @@ struct BrowserSession {
     console: Arc<Mutex<VecDeque<ConsoleLine>>>,
     /// UI-visible task (browser process) — finished on close.
     task_id: Option<uuid::Uuid>,
+    /// Console/dialog listeners — aborted with the session on close/relaunch.
+    background: Vec<tokio::task::JoinHandle<()>>,
 }
 
 #[cfg(feature = "browser")]
@@ -311,9 +316,19 @@ impl BrowserStore {
         let _ = page.execute(RuntimeEnable::default()).await;
         let _ = page.execute(LogEnable::default()).await;
 
-        // Console capture tasks.
+        // Console capture + dialog handling tasks (aborted with the session).
         let console: Arc<Mutex<VecDeque<ConsoleLine>>> = Arc::new(Mutex::new(VecDeque::new()));
-        spawn_console_capture(&page, console.clone()).await;
+        let mut background = spawn_console_capture(&page, console.clone()).await;
+        background.push(spawn_dialog_handler(&page, console.clone()).await);
+
+        // Popup policy: `target=_blank` / `window.open` navigates THIS tab
+        // instead of spawning untracked popups. Injected before any document
+        // script runs (applies from the first navigation onward).
+        let popup_guard = AddScriptToEvaluateOnNewDocumentParams::builder()
+            .source(POPUP_GUARD_JS)
+            .build()
+            .map_err(|e| BrowserError::Cdp(format!("popup guard: {e}")))?;
+        let _ = page.execute(popup_guard).await;
 
         // Seed the shared registry so the browser is visible in the desktop UI.
         let task_id = uuid::Uuid::new_v4();
@@ -334,6 +349,7 @@ impl BrowserStore {
             refs: HashMap::new(),
             console,
             task_id: Some(task_id),
+            background,
         };
 
         // Optional initial navigation (also builds the first snapshot).
@@ -815,6 +831,9 @@ impl BrowserStore {
 
     pub async fn close(&self, _kill: bool) -> Result<BrowserCloseResult, BrowserError> {
         if let Some(mut s) = self.sessions.lock().await.remove(Self::SESSION) {
+            for h in s.background.drain(..) {
+                h.abort();
+            }
             let _ = s.browser.close().await;
             s._driver.abort();
             if let Some(id) = s.task_id.take() {
@@ -834,11 +853,12 @@ impl BrowserStore {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "browser")]
-async fn spawn_console_capture(page: &Page, ring: Arc<Mutex<VecDeque<ConsoleLine>>>) {
+async fn spawn_console_capture(page: &Page, ring: Arc<Mutex<VecDeque<ConsoleLine>>>) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut handles = Vec::new();
     // Runtime.consoleAPICalled → error/warning lines matter most.
     if let Ok(mut stream) = page.event_listener::<EventConsoleApiCalled>().await {
         let ring = ring.clone();
-        tokio::spawn(async move {
+        handles.push(tokio::spawn(async move {
             while let Some(ev) = futures_util::StreamExt::next(&mut stream).await {
                 let Ok(v) = serde_json::to_value(&*ev) else { continue };
                 let level = v
@@ -851,12 +871,12 @@ async fn spawn_console_capture(page: &Page, ring: Arc<Mutex<VecDeque<ConsoleLine
                     push_console(&ring, ConsoleLine { level, text });
                 }
             }
-        });
+        }));
     }
     // Log.entryAdded → network errors, violations, deprecations.
     if let Ok(mut stream) = page.event_listener::<EventEntryAdded>().await {
         let ring = ring.clone();
-        tokio::spawn(async move {
+        handles.push(tokio::spawn(async move {
             while let Some(ev) = futures_util::StreamExt::next(&mut stream).await {
                 let Ok(v) = serde_json::to_value(&*ev) else { continue };
                 let level = v
@@ -874,8 +894,9 @@ async fn spawn_console_capture(page: &Page, ring: Arc<Mutex<VecDeque<ConsoleLine
                 }
                 push_console(&ring, ConsoleLine { level, text });
             }
-        });
+        }));
     }
+    handles
 }
 
 #[cfg(feature = "browser")]
@@ -907,6 +928,72 @@ fn console_args_text(ev: &Value) -> String {
         }
     }
     parts.join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// Dialog + popup policy
+// ---------------------------------------------------------------------------
+
+/// Injected on every new document: route `window.open` to the SAME tab so
+/// `target=_blank` links stay inside the session's tracked page instead of
+/// spawning untracked popups (the agent would keep acting on a stale tab).
+/// Real navigation, so `beforeunload` handlers still get to run; returning
+/// `null` matches the spec for a blocked popup.
+#[cfg(feature = "browser")]
+const POPUP_GUARD_JS: &str = r"(() => {
+  const realOpen = window.open.bind(window);
+  window.open = (url, target, features) => {
+    try {
+      const abs = new URL(url, location.href).href;
+      if (abs !== location.href) location.href = abs;
+      return null;
+    } catch {
+      return realOpen(url, target, features);
+    }
+  };
+})();";
+
+/// Auto-dismiss JS dialogs. `accept=false` maps to: confirm → cancel,
+/// prompt → null, beforeunload → stay on the page — the safe default in
+/// every case, and the page never blocks on us (we answer immediately).
+#[cfg(feature = "browser")]
+async fn spawn_dialog_handler(
+    page: &Page,
+    ring: Arc<Mutex<VecDeque<ConsoleLine>>>,
+) -> tokio::task::JoinHandle<()> {
+    let stream = page
+        .event_listener::<EventJavascriptDialogOpening>()
+        .await
+        .expect("dialog event listener");
+    let handler = page.clone();
+    tokio::spawn(async move {
+        let mut stream = stream;
+        while let Some(ev) = futures_util::StreamExt::next(&mut stream).await {
+            let v = match serde_json::to_value(&*ev) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let _ = handler
+                .execute(HandleJavaScriptDialogParams::new(false))
+                .await;
+            let line = dialog_console_line(
+                v.get("type").and_then(Value::as_str).unwrap_or("dialog"),
+                v.get("message").and_then(Value::as_str).unwrap_or(""),
+                v.get("url").and_then(Value::as_str).unwrap_or(""),
+            );
+            push_console(&ring, line);
+        }
+    })
+}
+
+/// Console ring entry for a dismissed dialog — the agent's only visibility
+/// into what the page asked (surfaced on the next snapshot drain).
+#[cfg(feature = "browser")]
+fn dialog_console_line(kind: &str, message: &str, url: &str) -> ConsoleLine {
+    ConsoleLine {
+        level: "dialog".to_string(),
+        text: format!("[{kind}] {message} — dismissed ({url})"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,6 +1244,23 @@ mod tests {
         // but the contract is that neither mode means "no wait requested".
         let p = WaitParams { timeout_ms: None, text: None, sleep_ms: None };
         assert!(p.text.is_none() && p.sleep_ms.is_none());
+    }
+
+    #[test]
+    fn popup_guard_js_overrides_window_open_same_tab() {
+        // Shape contract: an IIFE that overrides window.open, resolves the
+        // URL against the current document and navigates THIS tab.
+        assert!(POPUP_GUARD_JS.contains("window.open ="));
+        assert!(POPUP_GUARD_JS.contains("new URL(url, location.href)"));
+        assert!(POPUP_GUARD_JS.contains("location.href = abs"));
+    }
+
+    #[cfg(feature = "browser")]
+    #[test]
+    fn dialog_console_line_records_dismissal() {
+        let line = dialog_console_line("confirm", "¿Borrar todo?", "https://x.test/app");
+        assert_eq!(line.level, "dialog");
+        assert_eq!(line.text, "[confirm] ¿Borrar todo? — dismissed (https://x.test/app)");
     }
 
     #[cfg(feature = "browser")]
