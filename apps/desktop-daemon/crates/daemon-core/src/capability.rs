@@ -98,6 +98,46 @@ impl CapabilityGate {
         }
         false
     }
+
+    /// Defensa 3: symlink escape. El matching anterior es léxico; un
+    /// directorio dentro del root puede ser un symlink que apunta fuera
+    /// (`workspace/link -> /etc`), y un write a través de él aterrizaría
+    /// fuera del workspace con un Allow lexical. Antes de conceder Allow
+    /// para una acción que toca disco, se resuelve la ruta REAL del sistema
+    /// y se vuelve a exigir que siga dentro de un prefix permitido. Sin
+    /// symlinks en la cadena, la ruta resuelta es idéntica (coste: un
+    /// syscall); con ellos, la decisión degrada a RequireConsent — el
+    /// usuario ve el diálogo y aprueba (o no) la ruta externa concreta.
+    pub fn check_path_real(&self, capability: &str, path: &Path) -> std::io::Result<GateDecision> {
+        match self.check_path(capability, path) {
+            GateDecision::Allow => {
+                // El target puede no existir aún (write de fichero nuevo):
+                // se resuelve el ancestro existente más profundo — sus
+                // symlinks intermedios ya delatan el escape.
+                let mut probe = path.to_path_buf();
+                let real = loop {
+                    match std::fs::canonicalize(&probe) {
+                        Ok(p) => break p,
+                        Err(_) => match probe.parent() {
+                            Some(parent) => probe = parent.to_path_buf(),
+                            None => return Ok(GateDecision::RequireConsent),
+                        },
+                    }
+                };
+                if self.path_matches_any(&real) {
+                    Ok(GateDecision::Allow)
+                } else {
+                    tracing::warn!(
+                        path = %path.display(),
+                        real = %real.display(),
+                        "symlink escape: resolved path outside scope — requiring consent"
+                    );
+                    Ok(GateDecision::RequireConsent)
+                }
+            }
+            other => Ok(other),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -174,5 +214,36 @@ mod tests {
             g.check_path("desktop.shell.execute", Path::new("/home/u/workspace/cmd")),
             GateDecision::Deny
         );
+    }
+
+    #[test]
+    fn symlink_escape_inside_root_requires_consent() {
+        let dir = std::env::temp_dir().join(format!("sh-gate-{}", uuid::Uuid::new_v4()));
+        let outside = std::env::temp_dir().join(format!("sh-gate-out-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&outside, dir.join("link")).unwrap();
+
+        let g = gate_with_paths(&[dir.to_str().unwrap()]);
+        // Léxico:Allow (la ruta pasa por dentro del root)…
+        assert_eq!(
+            g.check_path("desktop.fs.write", &dir.join("link/x.txt")),
+            GateDecision::Allow
+        );
+        // …real: el destino cae FUERA del root → consentimiento.
+        assert_eq!(
+            g.check_path_real("desktop.fs.write", &dir.join("link/x.txt")).unwrap(),
+            GateDecision::RequireConsent
+        );
+        // Sin symlink, la ruta resuelta sigue dentro → Allow intacto.
+        assert_eq!(
+            g.check_path_real("desktop.fs.write", &dir.join("plain.txt")).unwrap(),
+            GateDecision::Allow
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

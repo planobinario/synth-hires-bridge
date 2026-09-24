@@ -295,7 +295,25 @@ impl<'a> FsOps<'a> {
     }
 
     fn gate_for_path(&self, capability: &str, path: &Path) -> Result<()> {
-        match self.gate.check_path(capability, path) {
+        // Mutaciones de disco atraviesan el chequeo real (symlinks
+        // resueltos): un dir dentro del root que apunte fuera degrada a
+        // RequireConsent en vez de Allow lexical. Lecturas/listados no
+        // cambian de semántica (el consentimiento de fs.read ya es
+        // per-acción cuando no hay always-allow).
+        let real_check = capability != "desktop.fs.read";
+        let decision = if real_check {
+            self.gate
+                .check_path_real(capability, path)
+                .map_err(|e| {
+                    DaemonError::CapabilityDenied(format!(
+                        "{}: no se pudo resolver la ruta real: {e}",
+                        path.display()
+                    ))
+                })?
+        } else {
+            self.gate.check_path(capability, path)
+        };
+        match decision {
             GateDecision::Allow => Ok(()),
             GateDecision::RequireConsent => Err(DaemonError::CapabilityDenied(format!(
                 "{} requires consent for {}",
