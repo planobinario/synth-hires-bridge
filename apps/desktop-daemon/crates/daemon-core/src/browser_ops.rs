@@ -35,6 +35,7 @@ use chromiumoxide::{
             DispatchMouseEventType, InsertTextParams, MouseButton,
         },
         log::{EnableParams as LogEnable, EventEntryAdded},
+        network::{EnableParams as NetworkEnable, EventLoadingFailed, EventResponseReceived},
         page::{
             AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat,
             EventJavascriptDialogOpening, HandleJavaScriptDialogParams,
@@ -79,7 +80,10 @@ impl std::fmt::Display for BrowserError {
                 "Chrome/Chromium/Edge not found (set $CHROME or install chromium)"
             ),
             Self::UnknownRef(r) => write!(f, "unknown ref {r} — take a fresh snapshot"),
-            Self::BadAction(a) => write!(f, "unknown action '{a}' (click|type|press|scroll)"),
+            Self::BadAction(a) => write!(
+                f,
+                "unknown action '{a}' (click|type|press|scroll|hover|back|forward|reload)"
+            ),
             Self::BadKey(k) => write!(f, "unknown key '{k}' (try 'Enter', 'Tab', 'Escape', 'ArrowDown', 'a'…)"),
             Self::Cdp(m) => write!(f, "{m}"),
         }
@@ -141,6 +145,10 @@ pub struct SnapshotResult {
     pub text: String,
     /// Console/page errors since the last snapshot (drained).
     pub console: Vec<ConsoleLine>,
+    /// Network responses since the last snapshot (drained): failures first
+    /// in the agent's mind — 4xx/5xx, aborted loads — plus what actually ran.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub network: Vec<NetworkLine>,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,16 +157,38 @@ pub struct ConsoleLine {
     pub text: String,
 }
 
+/// One observed HTTP response (or failed load) on the automated page.
+#[derive(Debug, Serialize)]
+pub struct NetworkLine {
+    pub status: u64,
+    /// CDP resource type: Document, XHR, Fetch, Script, Stylesheet, Image…
+    pub resource_type: String,
+    pub url: String,
+    /// Present only for failed/canceled loads (DNS, blocked, aborted…).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct BrowserActParams {
-    /// Ref from the last snapshot (not needed for `press`/`scroll`).
+    /// Ref from the last snapshot (not needed for `press`/`scroll`/`back`/
+    /// `forward`/`reload`).
     #[serde(rename = "ref", default)]
     pub element_ref: i64,
-    /// click | type | press | scroll
+    /// click | type | press | scroll | hover | back | forward | reload
     pub action: String,
     /// `type`: text to insert; `press`: key name; `scroll`: "up"|"down"|"left"|"right".
     #[serde(default)]
     pub text: Option<String>,
+    /// Modifier keys held during click/press: subset of alt|ctrl|meta|shift.
+    #[serde(default)]
+    pub modifiers: Option<Vec<String>>,
+    /// Mouse button for `click`: "left" (default) | "right" | "middle".
+    #[serde(default)]
+    pub button: Option<String>,
+    /// Click count: 1 (default) or 2 for double-click.
+    #[serde(default)]
+    pub click_count: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -183,6 +213,12 @@ pub struct ScreenshotParams {
 }
 
 #[derive(Debug, Serialize)]
+pub struct BrowserEvalResult {
+    /// JSON result of the expression (serde_json Value; Null when undefined).
+    pub value: Value,
+}
+
+#[derive(Debug, Serialize)]
 pub struct ScreenshotResult {
     /// base64 image (like fs.read images).
     pub base64: String,
@@ -200,6 +236,12 @@ pub struct WaitParams {
     /// Plain sleep — no polling (use when the effect needs time, not a signal).
     #[serde(default)]
     pub sleep_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BrowserEvalParams {
+    /// JavaScript expression to evaluate in the page (read-only convention).
+    pub expression: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -235,6 +277,8 @@ struct BrowserSession {
     refs: HashMap<i64, i64>,
     /// Console + page-error ring buffer (drained on snapshot).
     console: Arc<Mutex<VecDeque<ConsoleLine>>>,
+    /// Network responses ring buffer (drained on snapshot).
+    network: Arc<Mutex<VecDeque<NetworkLine>>>,
     /// UI-visible task (browser process) — finished on close.
     task_id: Option<uuid::Uuid>,
     /// Console/dialog listeners — aborted with the session on close/relaunch.
@@ -258,6 +302,10 @@ impl Default for BrowserStore {
 /// Ring-buffer capacity for console lines per session.
 #[cfg(feature = "browser")]
 const CONSOLE_RING: usize = 200;
+
+/// Ring-buffer capacity for network lines per session.
+#[cfg(feature = "browser")]
+const NETWORK_RING: usize = 200;
 
 #[cfg(feature = "browser")]
 impl BrowserStore {
@@ -312,14 +360,21 @@ impl BrowserStore {
             .await
             .map_err(|e| BrowserError::Cdp(format!("new_page: {e}")))?;
 
-        // Enable console + log domains (error capture).
+        // Enable console + log + network domains (error/visibility capture).
         let _ = page.execute(RuntimeEnable::default()).await;
         let _ = page.execute(LogEnable::default()).await;
+        let _ = page.execute(NetworkEnable::default()).await;
 
         // Console capture + dialog handling tasks (aborted with the session).
         let console: Arc<Mutex<VecDeque<ConsoleLine>>> = Arc::new(Mutex::new(VecDeque::new()));
         let mut background = spawn_console_capture(&page, console.clone()).await;
         background.push(spawn_dialog_handler(&page, console.clone()).await);
+
+        // Network capture: the agent sees what the page fetched and what
+        // broke (failed/canceled loads first in the snapshot), not just
+        // what it rendered.
+        let network: Arc<Mutex<VecDeque<NetworkLine>>> = Arc::new(Mutex::new(VecDeque::new()));
+        background.extend(spawn_network_capture(&page, network.clone()).await);
 
         // Popup policy: `target=_blank` / `window.open` navigates THIS tab
         // instead of spawning untracked popups. Injected before any document
@@ -353,6 +408,7 @@ impl BrowserStore {
             page,
             refs: HashMap::new(),
             console,
+            network,
             task_id: Some(task_id),
             background,
         };
@@ -444,9 +500,13 @@ impl BrowserStore {
             .ok()
             .and_then(|r| r.value().and_then(|v| v.as_str().map(str::to_owned)));
 
-        // Drain console ring.
+        // Drain console + network rings.
         let console: Vec<ConsoleLine> = {
             let mut ring = session.console.lock().await;
+            ring.drain(..).collect()
+        };
+        let network: Vec<NetworkLine> = {
+            let mut ring = session.network.lock().await;
             ring.drain(..).collect()
         };
 
@@ -546,6 +606,7 @@ impl BrowserStore {
             truncated: total > limit,
             text: out,
             console,
+            network,
         })
     }
 
@@ -555,13 +616,19 @@ impl BrowserStore {
         let mut sessions = self.sessions.lock().await;
         let session = sessions.get_mut(Self::SESSION).ok_or(BrowserError::NoSession)?;
 
+        let mask = modifier_mask(p.modifiers.as_deref());
+
         match p.action.as_str() {
             "click" => {
-                self.act_click(session, p.element_ref).await?;
+                self.act_click(session, p.element_ref, mask, p.button.as_deref(), p.click_count)
+                    .await?;
+            }
+            "hover" => {
+                self.act_hover(session, p.element_ref).await?;
             }
             "type" => {
                 let text = p.text.clone().unwrap_or_default();
-                self.act_click(session, p.element_ref).await?;
+                self.act_click(session, p.element_ref, mask, None, None).await?;
                 session
                     .page
                     .execute(InsertTextParams::new(text))
@@ -570,11 +637,23 @@ impl BrowserStore {
             }
             "press" => {
                 let key = p.text.clone().unwrap_or_else(|| "Enter".into());
-                self.act_press(session, &key).await?;
+                self.act_press(session, &key, mask).await?;
             }
             "scroll" => {
                 let dir = p.text.clone().unwrap_or_else(|| "down".into());
                 self.act_scroll(session, &dir).await?;
+            }
+            "back" | "forward" => {
+                let go = if p.action == "back" {
+                    "history.back()"
+                } else {
+                    "history.forward()"
+                };
+                let _ = session.page.evaluate_expression(go).await;
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+            "reload" => {
+                self.act_reload_with_session(session).await?;
             }
             other => return Err(BrowserError::BadAction(other.to_string())),
         }
@@ -585,7 +664,14 @@ impl BrowserStore {
         Ok(BrowserActResult { ok: true, snapshot })
     }
 
-    async fn act_click(&self, session: &mut BrowserSession, r: i64) -> Result<(), BrowserError> {
+    async fn act_click(
+        &self,
+        session: &mut BrowserSession,
+        r: i64,
+        modifiers: u8,
+        button: Option<&str>,
+        click_count: Option<i32>,
+    ) -> Result<(), BrowserError> {
         let backend = *session.refs.get(&r).ok_or(BrowserError::UnknownRef(r))?;
 
         // Scroll into view + focus via DOM domain, then a real mouse click
@@ -620,16 +706,27 @@ impl BrowserStore {
         let (cx, cy) = quad_center(&serde_json::to_value(&quads.result.quads).unwrap_or_default())
             .ok_or_else(|| BrowserError::Cdp("element has no layout box".into()))?;
 
+        let btn = match button.unwrap_or("left") {
+            "right" => MouseButton::Right,
+            "middle" => MouseButton::Middle,
+            _ => MouseButton::Left,
+        };
+        let count = click_count.unwrap_or(1).clamp(1, 3);
         for ty in [
             DispatchMouseEventType::MousePressed,
             DispatchMouseEventType::MouseReleased,
         ] {
-            let b = DispatchMouseEventParams::builder()
-                .r#type(ty)
+            let mut b = DispatchMouseEventParams::builder()
+                .r#type(ty.clone())
                 .x(cx)
                 .y(cy)
-                .button(MouseButton::Left)
-                .click_count(1)
+                .button(btn.clone())
+                .click_count(count)
+                .modifiers(modifiers);
+            if ty == DispatchMouseEventType::MousePressed {
+                b = b.buttons(pressed_buttons_mask(button));
+            }
+            let b = b
                 .build()
                 .map_err(|e| BrowserError::Cdp(format!("mouse params: {e}")))?;
             session
@@ -641,7 +738,65 @@ impl BrowserStore {
         Ok(())
     }
 
-    async fn act_press(&self, session: &mut BrowserSession, key: &str) -> Result<(), BrowserError> {
+    async fn act_hover(&self, session: &mut BrowserSession, r: i64) -> Result<(), BrowserError> {
+        let backend = *session.refs.get(&r).ok_or(BrowserError::UnknownRef(r))?;
+        let _ = session
+            .page
+            .execute(
+                ScrollIntoViewIfNeededParams::builder()
+                    .backend_node_id(BackendNodeId::new(backend))
+                    .build(),
+            )
+            .await;
+        let quads = session
+            .page
+            .execute(
+                GetContentQuadsParams::builder()
+                    .backend_node_id(BackendNodeId::new(backend))
+                    .build(),
+            )
+            .await
+            .map_err(|e| BrowserError::Cdp(format!("quads: {e}")))?;
+        let (cx, cy) = quad_center(&serde_json::to_value(&quads.result.quads).unwrap_or_default())
+            .ok_or_else(|| BrowserError::Cdp("element has no layout box".into()))?;
+        // MouseMoved with buttons=0: the canonical CDP hover.
+        let b = DispatchMouseEventParams::builder()
+            .r#type(DispatchMouseEventType::MouseMoved)
+            .x(cx)
+            .y(cy)
+            .buttons(0)
+            .build()
+            .map_err(|e| BrowserError::Cdp(format!("mouse params: {e}")))?;
+        session
+            .page
+            .execute(b)
+            .await
+            .map_err(|e| BrowserError::Cdp(format!("hover: {e}")))?;
+        Ok(())
+    }
+
+    /// `Page.reload` without cache validation; the AX snapshot follows in
+    /// `act`'s settle path (this helper only reloads the page).
+    async fn act_reload_with_session(
+        &self,
+        session: &mut BrowserSession,
+    ) -> Result<(), BrowserError> {
+        use chromiumoxide::cdp::browser_protocol::page::ReloadParams;
+        session
+            .page
+            .execute(ReloadParams::builder().build())
+            .await
+            .map_err(|e| BrowserError::Cdp(format!("reload: {e}")))?;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        Ok(())
+    }
+
+    async fn act_press(
+        &self,
+        session: &mut BrowserSession,
+        key: &str,
+        modifiers: u8,
+    ) -> Result<(), BrowserError> {
         let def = keys::USKEYBOARD_LAYOUT
             .iter()
             .find(|k| k.key.eq_ignore_ascii_case(key) || k.code.eq_ignore_ascii_case(key))
@@ -652,6 +807,7 @@ impl BrowserStore {
             .key(def.key)
             .code(def.code)
             .windows_virtual_key_code(def.key_code)
+            .modifiers(modifiers)
             .build()
             .map_err(|e| BrowserError::Cdp(format!("key params: {e}")))?;
         session
@@ -667,6 +823,7 @@ impl BrowserStore {
                 .text(text)
                 .unmodified_text(def.key)
                 .windows_virtual_key_code(def.key_code)
+                .modifiers(modifiers)
                 .build()
                 .map_err(|e| BrowserError::Cdp(format!("key params: {e}")))?;
             session
@@ -680,6 +837,7 @@ impl BrowserStore {
             .key(def.key)
             .code(def.code)
             .windows_virtual_key_code(def.key_code)
+            .modifiers(modifiers)
             .build()
             .map_err(|e| BrowserError::Cdp(format!("key params: {e}")))?;
         session
@@ -747,13 +905,28 @@ impl BrowserStore {
 
     // -- wait ----------------------------------------------------------------
 
-    /// True when `text` appears in the current AX tree. Deliberately does NOT
+    /// True when `text` appears in the current page. Fast path evaluates the
+    /// containment test IN the page (one round-trip per poll instead of a
+    /// full CDP tree serialization); on eval failure (mid-navigation, sandboxed
+    /// frame) it falls back to the strict AX-tree check. Deliberately does NOT
     /// touch the console ring or the ref map: intermediate polls must not
     /// consume console errors that belong to the final snapshot.
     #[cfg(feature = "browser")]
     async fn ax_tree_contains(&self, text: &str) -> Result<bool, BrowserError> {
         let sessions = self.sessions.lock().await;
         let session = sessions.get(Self::SESSION).ok_or(BrowserError::NoSession)?;
+
+        // Fast path: document.body.innerText approximates the AX name/value
+        // sources (visible text) at one round-trip per poll.
+        let expr = format!(
+            "(() => {{ try {{ return !!(document.body && document.body.innerText.includes({})); }} catch (_) {{ return false; }} }})()",
+            json_escape(text)
+        );
+        if let Ok(r) = session.page.evaluate_expression(&expr).await {
+            return Ok(r.value().and_then(Value::as_bool).unwrap_or(false));
+        }
+
+        // Fallback: strict AX-tree check (page mid-navigation or eval unavailable).
         let res = session
             .page
             .execute(GetFullAxTreeParams::default())
@@ -818,7 +991,7 @@ impl BrowserStore {
         Ok(WaitResult { matched: true, waited_ms: waited, snapshot: Some(snapshot) })
     }
 
-    // -- eval (escape hatch) -------------------------------------------------
+    // -- eval (escape hatch) -----------------------------------------------
 
     /// Run a JS expression in the page — read-only uses (metrics, probing).
     pub async fn evaluate(&self, expression: &str) -> Result<Value, BrowserError> {
@@ -830,6 +1003,15 @@ impl BrowserStore {
             .await
             .map_err(|e| BrowserError::Cdp(format!("evaluate: {e}")))?;
         Ok(r.value().cloned().unwrap_or(Value::Null))
+    }
+
+    // -- eval (agent-facing op) ---------------------------------------------
+
+    /// Agent-facing eval op: same engine as `evaluate` (read-only
+    /// convention), exposed as `desktop.browser.eval` for metrics/probing.
+    pub async fn eval(&self, p: BrowserEvalParams) -> Result<BrowserEvalResult, BrowserError> {
+        let value = self.evaluate(&p.expression).await?;
+        Ok(BrowserEvalResult { value })
     }
 
     // -- close ---------------------------------------------------------------
@@ -904,14 +1086,93 @@ async fn spawn_console_capture(page: &Page, ring: Arc<Mutex<VecDeque<ConsoleLine
     handles
 }
 
-#[cfg(feature = "browser")]
-fn push_console(ring: &Mutex<VecDeque<ConsoleLine>>, line: ConsoleLine) {
+fn push_ring<T>(ring: &Mutex<VecDeque<T>>, item: T, cap: usize) {
     if let Ok(mut r) = ring.try_lock() {
-        if r.len() >= CONSOLE_RING {
+        if r.len() >= cap {
             r.pop_front();
         }
-        r.push_back(line);
+        r.push_back(item);
     }
+}
+
+#[cfg(feature = "browser")]
+fn push_console(ring: &Mutex<VecDeque<ConsoleLine>>, line: ConsoleLine) {
+    push_ring(ring, line, CONSOLE_RING);
+}
+
+/// Capture Network.responseReceived + Network.loadingFailed per session.
+#[cfg(feature = "browser")]
+async fn spawn_network_capture(
+    page: &Page,
+    ring: Arc<Mutex<VecDeque<NetworkLine>>>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut handles = Vec::new();
+    if let Ok(mut stream) = page.event_listener::<EventResponseReceived>().await {
+        let ring = ring.clone();
+        handles.push(tokio::spawn(async move {
+            while let Some(ev) = futures_util::StreamExt::next(&mut stream).await {
+                let Ok(v) = serde_json::to_value(&*ev) else { continue };
+                let status = v
+                    .pointer("/response/status")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let url = v
+                    .pointer("/response/url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if url.is_empty() {
+                    continue;
+                }
+                let resource_type = v
+                    .pointer("/type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let error: Option<String> = if (400..600).contains(&status) {
+                    Some(format!("HTTP {status}"))
+                } else {
+                    None
+                };
+                push_ring(&ring, NetworkLine { status, resource_type, url, error }, NETWORK_RING);
+            }
+        }));
+    }
+    if let Ok(mut stream) = page.event_listener::<EventLoadingFailed>().await {
+        handles.push(tokio::spawn(async move {
+            while let Some(ev) = futures_util::StreamExt::next(&mut stream).await {
+                let Ok(v) = serde_json::to_value(&*ev) else { continue };
+                let url = v
+                    .get("requestId")
+                    .and_then(Value::as_str)
+                    .map(|id| format!("(request {id})"))
+                    .unwrap_or_else(|| "(unknown request)".to_string());
+                let et = v
+                    .get("errorText")
+                    .and_then(Value::as_str)
+                    .unwrap_or("failed");
+                let canceled = v
+                    .get("canceled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                push_ring(
+                    &ring,
+                    NetworkLine {
+                        status: 0,
+                        resource_type: String::new(),
+                        url,
+                        error: Some(if canceled {
+                            format!("{et} (canceled)")
+                        } else {
+                            et.to_string()
+                        }),
+                    },
+                    NETWORK_RING,
+                );
+            }
+        }));
+    }
+    handles
 }
 
 #[cfg(feature = "browser")]
@@ -1115,6 +1376,28 @@ fn quad_center(quads: &Value) -> Option<(f64, f64)> {
     None
 }
 
+/// JSON string literal (quotes + escapes), safe for inline JS expressions.
+#[cfg_attr(not(feature = "browser"), allow(dead_code))]
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Minimal standard base64 (RFC 4648) — avoids adding a dependency for one fn.
 #[cfg_attr(not(feature = "browser"), allow(dead_code))]
 fn base64_encode(data: &[u8]) -> String {
@@ -1141,6 +1424,35 @@ fn base64_encode(data: &[u8]) -> String {
         });
     }
     out
+}
+
+/// CDP `Input.dispatchMouseEvent`/`dispatchKeyEvent` modifier bitfield.
+/// Unknown names are ignored (fail-open), `alt=1 ctrl=2 meta/ctrl(cmd)=4
+/// shift=8` per the DevTools protocol.
+#[cfg_attr(not(feature = "browser"), allow(dead_code))]
+fn modifier_mask(mods: Option<&[String]>) -> u8 {
+    let mut m = 0u8;
+    for s in mods.unwrap_or(&[]) {
+        match s.to_ascii_lowercase().as_str() {
+            "alt" | "option" | "⌥" => m |= 1,
+            "ctrl" | "control" | "^" => m |= 2,
+            "meta" | "cmd" | "command" | "super" | "win" | "⌘" => m |= 4,
+            "shift" | "⇧" => m |= 8,
+            _ => {}
+        }
+    }
+    m
+}
+
+/// `buttons` bitmask for a mouse-pressed event (bit 0 left, 1 right,
+/// 2 middle) — some pages read `event.buttons`, not `event.button`.
+#[cfg_attr(not(feature = "browser"), allow(dead_code))]
+fn pressed_buttons_mask(button: Option<&str>) -> i32 {
+    match button.unwrap_or("left") {
+        "right" => 2,
+        "middle" => 4,
+        _ => 1,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1186,6 +1498,12 @@ impl BrowserStore {
     pub async fn has_session(&self) -> bool {
         false
     }
+    pub async fn eval(
+        &self,
+        _p: BrowserEvalParams,
+    ) -> Result<BrowserEvalResult, BrowserError> {
+        Err(BrowserError::NotAvailable("compiled without the browser feature"))
+    }
 }
 
 // Shared serde default used by `BrowserCloseParams` in both configurations.
@@ -1214,6 +1532,38 @@ mod tests {
         assert_eq!(ax_text(Some(&b)), "true");
         assert_eq!(ax_text(None), "");
         assert_eq!(ax_text(Some(&json!({"type": "string"}))), "");
+    }
+
+    #[test]
+    fn modifier_mask_maps_names_and_ignores_unknown() {
+        let m = |s: &[&str]| modifier_mask(Some(&s.iter().map(|x| x.to_string()).collect::<Vec<_>>()));
+        assert_eq!(m(&["alt"]), 1);
+        assert_eq!(m(&["Ctrl"]), 2);
+        assert_eq!(m(&["Meta"]), 4);
+        assert_eq!(m(&["shift"]), 8);
+        assert_eq!(m(&["alt", "ctrl", "shift"]), 11);
+        assert_eq!(m(&["option", "cmd", "⇧"]), 13);
+        assert_eq!(m(&["hyper"]), 0);
+        assert_eq!(modifier_mask(None), 0);
+    }
+
+    #[test]
+    fn pressed_buttons_mask_matches_cdp_semantics() {
+        assert_eq!(pressed_buttons_mask(None), 1);
+        assert_eq!(pressed_buttons_mask(Some("left")), 1);
+        assert_eq!(pressed_buttons_mask(Some("right")), 2);
+        assert_eq!(pressed_buttons_mask(Some("middle")), 4);
+    }
+
+    #[test]
+    fn json_escape_is_a_valid_json_string_literal() {
+        let v = serde_json::from_str::<String>(&json_escape("a\"b\\c\nd\te"))
+            .expect("round-trips through serde");
+        assert_eq!(v, "a\"b\\c\nd\te");
+        // Control chars are \u-escaped, so the literal stays single-line.
+        let lit = json_escape("\u{0001}");
+        assert_eq!(lit, "\"\\u0001\"");
+        assert!(!lit.contains('\u{0001}'));
     }
 
     #[test]

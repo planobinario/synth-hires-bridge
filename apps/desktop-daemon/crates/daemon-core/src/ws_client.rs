@@ -329,7 +329,7 @@ impl WsClient {
             "desktop.browser.launch" | "desktop.browser.nav" => "desktop.network.fetch",
             "desktop.browser.act" => "desktop.shell.execute",
             "desktop.browser.snapshot" | "desktop.browser.shot" | "desktop.browser.wait"
-            | "desktop.browser.close" => "desktop.fs.read",
+            | "desktop.browser.close" | "desktop.browser.eval" => "desktop.fs.read",
             // Debugger: start/eval/flow-control are as powerful as a shell;
             // inspection ops (breakpoints, stack, variables, threads) are reads.
             "desktop.debug.op" => match request.params.get("op").and_then(|v| v.as_str()) {
@@ -618,6 +618,11 @@ impl WsClient {
                     self.browser.wait(value).await
                 })
             }
+            "desktop.browser.eval" => {
+                dispatch_op!(self, ws, request, started, value, req, crate::browser_ops::BrowserEvalParams, {
+                    self.browser.eval(value).await
+                })
+ }
             "desktop.debug.op" => {
                 dispatch_op!(self, ws, request, started, value, req, crate::dap_ops::DapOp, {
                     self.dap.execute(value).await

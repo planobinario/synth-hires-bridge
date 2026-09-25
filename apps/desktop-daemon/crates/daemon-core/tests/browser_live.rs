@@ -173,6 +173,9 @@ async fn live_browser_dialogs_do_not_freeze_and_popups_stay_in_session() {
             element_ref: btn_ref,
             action: "click".into(),
             text: None,
+            modifiers: None,
+            button: None,
+            click_count: None,
         })
         .await
         .expect("click by snapshot ref should work");
@@ -263,6 +266,9 @@ async fn live_browser_dialogs_do_not_freeze_and_popups_stay_in_session() {
             element_ref: anchor_ref,
             action: "click".into(),
             text: None,
+            modifiers: None,
+            button: None,
+            click_count: None,
         })
         .await
         .expect("anchor click dispatches");
