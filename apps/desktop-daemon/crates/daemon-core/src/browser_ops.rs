@@ -281,6 +281,8 @@ struct BrowserSession {
     network: Arc<Mutex<VecDeque<NetworkLine>>>,
     /// UI-visible task (browser process) — finished on close.
     task_id: Option<uuid::Uuid>,
+    /// Per-session Chrome profile dir — best-effort removed on close.
+    user_data_dir: std::path::PathBuf,
     /// Console/dialog listeners — aborted with the session on close/relaunch.
     background: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -329,7 +331,13 @@ impl BrowserStore {
         let binary = exe.display().to_string();
 
         let (w, h) = p.size.unwrap_or((1280, 1280));
+        // Unique profile dir per session: a shared dir dies with
+        // SingletonLock collisions when two sessions race (tests, or a
+        // relaunch right after a crashed Chrome left a stale lock behind).
+        let user_data_dir =
+            std::env::temp_dir().join(format!("synthhires-chrome-{}", uuid::Uuid::new_v4()));
         let mut config = BrowserConfig::builder()
+            .user_data_dir(&user_data_dir)
             .window_size(w, h)
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
@@ -411,6 +419,7 @@ impl BrowserStore {
             network,
             task_id: Some(task_id),
             background,
+            user_data_dir,
         };
 
         // Optional initial navigation (also builds the first snapshot).
@@ -712,28 +721,34 @@ impl BrowserStore {
             _ => MouseButton::Left,
         };
         let count = click_count.unwrap_or(1).clamp(1, 3);
-        for ty in [
-            DispatchMouseEventType::MousePressed,
-            DispatchMouseEventType::MouseReleased,
-        ] {
-            let mut b = DispatchMouseEventParams::builder()
-                .r#type(ty.clone())
-                .x(cx)
-                .y(cy)
-                .button(btn.clone())
-                .click_count(count)
-                .modifiers(modifiers);
-            if ty == DispatchMouseEventType::MousePressed {
-                b = b.buttons(pressed_buttons_mask(button));
+        // Canonical multi-click sequence (what real browsers and Playwright
+        // emit): a first click with count=1, then the higher-count pair — a
+        // single pair with clickCount=2 gives detail=2 but fires NO dblclick.
+        let presses: &[i32] = if count > 1 { &[1, count] } else { &[count] };
+        for &cc in presses {
+            for ty in [
+                DispatchMouseEventType::MousePressed,
+                DispatchMouseEventType::MouseReleased,
+            ] {
+                let mut b = DispatchMouseEventParams::builder()
+                    .r#type(ty.clone())
+                    .x(cx)
+                    .y(cy)
+                    .button(btn.clone())
+                    .click_count(cc)
+                    .modifiers(modifiers);
+                if ty == DispatchMouseEventType::MousePressed {
+                    b = b.buttons(pressed_buttons_mask(button));
+                }
+                let b = b
+                    .build()
+                    .map_err(|e| BrowserError::Cdp(format!("mouse params: {e}")))?;
+                session
+                    .page
+                    .execute(b)
+                    .await
+                    .map_err(|e| BrowserError::Cdp(format!("mouse: {e}")))?;
             }
-            let b = b
-                .build()
-                .map_err(|e| BrowserError::Cdp(format!("mouse params: {e}")))?;
-            session
-                .page
-                .execute(b)
-                .await
-                .map_err(|e| BrowserError::Cdp(format!("mouse: {e}")))?;
         }
         Ok(())
     }
@@ -1023,6 +1038,8 @@ impl BrowserStore {
             }
             let _ = s.browser.close().await;
             s._driver.abort();
+            // Best-effort profile cleanup (Chrome leaves the dir behind).
+            let _ = std::fs::remove_dir_all(&s.user_data_dir);
             if let Some(id) = s.task_id.take() {
                 finish_global_task(id, TaskStatus::Killed);
             }
