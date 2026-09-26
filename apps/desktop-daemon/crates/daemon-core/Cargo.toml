@@ -35,10 +35,11 @@ ast-grep-core = "0.45.3"
 ast-grep-language = "0.45.3"
 portable-pty = "0.9.0"
 chromiumoxide = { version = "0.9.1", optional = true }
+base64 = { version = "0.22", optional = true }
 
 [features]
 # CDP browser automation (chromiumoxide). Off by default; daemon-cli enables it.
-browser = ["dep:chromiumoxide"]
+browser = ["dep:chromiumoxide", "dep:base64"]
 
 [lib]
 name = "daemon_core"

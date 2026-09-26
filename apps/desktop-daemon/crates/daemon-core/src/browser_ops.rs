@@ -34,6 +34,10 @@ use chromiumoxide::{
             DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams,
             DispatchMouseEventType, InsertTextParams, MouseButton,
         },
+        fetch::{
+            ContinueRequestParams, EnableParams as FetchEnable, EventRequestPaused,
+            FulfillRequestParams, HeaderEntry, RequestPattern,
+        },
         log::{EnableParams as LogEnable, EventEntryAdded},
         network::{EnableParams as NetworkEnable, EventLoadingFailed, EventResponseReceived},
         page::{
@@ -276,6 +280,91 @@ pub struct BrowserCloseResult {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-tab + route mocks (browser slice, v2)
+// ---------------------------------------------------------------------------
+
+/// One interception rule: requests whose URL contains `url_contains` are
+/// served locally with `status` + `body` (and optional content type) instead
+/// of hitting the network. The FIRST matching rule wins.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MockRule {
+    #[serde(default)]
+    pub url_contains: String,
+    pub status: u16,
+    pub body: String,
+    #[serde(default)]
+    pub content_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MockSetParams {
+    /// Replace the whole rule set (idempotent) when Some; only-remove when None.
+    #[serde(default)]
+    pub rules: Option<Vec<MockRule>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MockSetResult {
+    pub active_rules: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabOpenParams {
+    pub url: Option<String>,
+    /// Caller-chosen tab id; defaults to "tab-N".
+    #[serde(default)]
+    pub tab_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabOpenResult {
+    pub tab_id: String,
+    pub url: String,
+    pub title: Option<String>,
+    pub tabs: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabSelectParams {
+    pub tab_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabSelectResult {
+    pub active_tab: String,
+    pub url: String,
+    pub tabs: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabCloseParams {
+    pub tab_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabCloseResult {
+    pub closed: bool,
+    pub active_tab: String,
+    pub tabs: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabListResult {
+    pub active_tab: String,
+    pub tabs: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Session state
 // ---------------------------------------------------------------------------
 
@@ -297,6 +386,17 @@ struct BrowserSession {
     user_data_dir: std::path::PathBuf,
     /// Console/dialog listeners — aborted with the session on close/relaunch.
     background: Vec<tokio::task::JoinHandle<()>>,
+    /// Multi-tab registry: tab id -> page. The ACTIVE tab is also `page`
+    /// (all existing verbs keep operating on the active tab unchanged).
+    tabs: HashMap<String, Page>,
+    active_tab: String,
+    /// Route-mock rules served by the Fetch interception listener. Shared
+    /// with the ONE persistent interception task (armed on first mock_set),
+    /// so rule updates apply live without stacking listeners.
+    mocks: std::sync::Arc<std::sync::Mutex<Vec<MockRule>>>,
+    /// True once the interception task exists (armed by the first non-empty
+    /// mock_set). Rules then update live through the shared Arc.
+    mock_listener_armed: bool,
 }
 
 #[cfg(feature = "browser")]
@@ -424,6 +524,10 @@ impl BrowserStore {
 
         let mut session = BrowserSession {
             _driver: driver,
+            tabs: HashMap::from([("main".to_string(), page.clone())]),
+            active_tab: "main".to_string(),
+            mocks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            mock_listener_armed: false,
             browser,
             page,
             refs: HashMap::new(),
@@ -491,7 +595,202 @@ impl BrowserStore {
         })
     }
 
+    // -- tabs ----------------------------------------------------------------
+
+    /// Opens a NEW tab (and makes it active). The snapshot pipeline is
+    /// per-tab, so the new tab starts with clean refs.
+    pub async fn tab_open(&self, p: TabOpenParams) -> Result<TabOpenResult, BrowserError> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions.get_mut(Self::SESSION).ok_or(BrowserError::NoSession)?;
+        let page = session
+            .browser
+            .new_page(p.url.as_deref().unwrap_or("about:blank"))
+            .await
+            .map_err(|e| BrowserError::Cdp(format!("tab open: {e}")))?;
+        // A new page needs the capture domains too (console/net listeners in
+        // launch were wired to the ORIGINAL page only).
+        let _ = page.execute(NetworkEnable::default()).await;
+        let tab_id = match p.tab_id {
+            Some(id) => id,
+            None => format!("tab-{}", session.tabs.len()),
+        };
+        session.tabs.insert(tab_id.clone(), page.clone());
+        session.active_tab = tab_id.clone();
+        // Rebind the session's active page/refs so existing verbs act HERE.
+        session.page = page;
+        session.refs = HashMap::new();
+        let url = p.url.unwrap_or_else(|| "about:blank".to_string());
+        Ok(TabOpenResult {
+            tab_id,
+            url,
+            title: None,
+            tabs: session.tabs.keys().cloned().collect(),
+        })
+    }
+
+    /// Switches the ACTIVE tab. Subsequent navigate/snapshot/act hit it.
+    pub async fn tab_select(&self, p: TabSelectParams) -> Result<TabSelectResult, BrowserError> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions.get_mut(Self::SESSION).ok_or(BrowserError::NoSession)?;
+        if !session.tabs.contains_key(&p.tab_id) {
+            return Err(BrowserError::Cdp(format!("no such tab: {}", p.tab_id)));
+        }
+        let page = session.tabs.get(&p.tab_id).cloned().expect("checked above");
+        session.active_tab = p.tab_id.clone();
+        session.page = page;
+        session.refs = HashMap::new();
+        // page.url() is async — read it while we still hold no other lock.
+        let url = session
+            .page
+            .url()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        Ok(TabSelectResult {
+            active_tab: session.active_tab.clone(),
+            url,
+            tabs: session.tabs.keys().cloned().collect(),
+        })
+    }
+
+    /// Closes a tab. Closing the ACTIVE one falls back to "main" (recreating
+    /// it is the browser's job only if the target survived — we never leave
+    /// the session without an active page).
+    pub async fn tab_close(&self, p: TabCloseParams) -> Result<TabCloseResult, BrowserError> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions.get_mut(Self::SESSION).ok_or(BrowserError::NoSession)?;
+        if !session.tabs.contains_key(&p.tab_id) {
+            return Err(BrowserError::Cdp(format!("no such tab: {}", p.tab_id)));
+        }
+        let page = session.tabs.remove(&p.tab_id).expect("checked above");
+        let _ = page.close().await;
+        if session.tabs.is_empty() {
+            // Last tab closed: the session is over. Tear down exactly like
+            // `close()` does — a session without tabs is not a session.
+            for h in session.background.drain(..) {
+                h.abort();
+            }
+            let _ = session.browser.close().await;
+            session._driver.abort();
+            let _ = std::fs::remove_dir_all(&session.user_data_dir);
+            if let Some(id) = session.task_id.take() {
+                finish_global_task(id, TaskStatus::Killed);
+            }
+            sessions.remove(Self::SESSION);
+            return Ok(TabCloseResult {
+                closed: true,
+                active_tab: String::new(),
+                tabs: Vec::new(),
+            });
+        }
+        if session.active_tab == p.tab_id {
+            let fallback = session.tabs.keys().next().cloned().expect("non-empty");
+            let page = session.tabs.get(&fallback).cloned().expect("checked");
+            session.active_tab = fallback;
+            session.page = page;
+            session.refs = HashMap::new();
+        }
+        Ok(TabCloseResult {
+            closed: true,
+            active_tab: session.active_tab.clone(),
+            tabs: session.tabs.keys().cloned().collect(),
+        })
+    }
+
+    pub async fn tab_list(&self) -> Result<TabListResult, BrowserError> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(Self::SESSION).ok_or(BrowserError::NoSession)?;
+        Ok(TabListResult {
+            active_tab: session.active_tab.clone(),
+            tabs: session.tabs.keys().cloned().collect(),
+        })
+    }
+
+    // -- route mocks ---------------------------------------------------------
+
+    /// Installs/replaces the interception rules. Idempotent: an empty rule
+    /// set disarms interception. The interception task is armed ONCE (first
+    /// non-empty set) and reads rules through a shared Arc, so subsequent
+    /// sets apply live and listeners never stack.
+    pub async fn mock_set(&self, p: MockSetParams) -> Result<MockSetResult, BrowserError> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions.get_mut(Self::SESSION).ok_or(BrowserError::NoSession)?;
+        let rules = p.rules.unwrap_or_default();
+        {
+            let mut guard = session.mocks.lock().unwrap();
+            *guard = rules.clone();
+        }
+        let armed = session.mock_listener_armed;
+
+        if !armed {
+            if rules.is_empty() {
+                return Ok(MockSetResult { active_rules: 0 });
+            }
+            let pattern = RequestPattern::builder().url_pattern("*").build();
+            session
+                .page
+                .execute(FetchEnable::builder().pattern(pattern).build())
+                .await
+                .map_err(|e| BrowserError::Cdp(format!("mock enable: {e}")))?;
+            // The listener serves from the SHARED rule set and CONTINUES
+            // everything unmatched — a paused request nobody answers hangs
+            // the page forever, which is worse than an unmapped mock.
+            let rules_shared = session.mocks.clone();
+            let listener = session.page.event_listener::<EventRequestPaused>().await;
+            let page = session.page.clone();
+            let handle = tokio::spawn(async move {
+                if let Ok(mut stream) = listener {
+                    while let Some(ev) = futures_util::StreamExt::next(&mut stream).await {
+                        let matched = {
+                            let guard = rules_shared.lock().unwrap();
+                            guard
+                                .iter()
+                                .find(|r| !r.url_contains.is_empty() && ev.request.url.contains(&r.url_contains))
+                                .cloned()
+                        };
+                        if let Some(rule) = matched {
+                            let header = HeaderEntry::new(
+                                "content-type",
+                                rule.content_type
+                                    .clone()
+                                    .unwrap_or_else(|| "application/json".to_string()),
+                            );
+                            use base64::Engine as _;
+                            let body_b64 =
+                                base64::engine::general_purpose::STANDARD.encode(rule.body.as_bytes());
+                            match FulfillRequestParams::builder()
+                                .request_id(ev.request_id.clone())
+                                .response_code(rule.status as i64)
+                                .response_header(header)
+                                .body(body_b64)
+                                .build()
+                            {
+                                Ok(params) => {
+                                    let _ = page.execute(params).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "mock fulfill build failed");
+                                }
+                            }
+                        } else if let Ok(params) =
+                            ContinueRequestParams::builder().request_id(ev.request_id.clone()).build()
+                        {
+                            let _ = page.execute(params).await;
+                        }
+                    }
+                }
+            });
+            session.background.push(handle);
+            session.mock_listener_armed = true;
+        }
+        Ok(MockSetResult {
+            active_rules: rules.len(),
+        })
+    }
+
     // -- snapshot ----------------------------------------------------------
+
 
     /// Full AX-tree snapshot, compacted, with stable refs.
     pub async fn snapshot(&self, p: SnapshotParams) -> Result<SnapshotResult, BrowserError> {
@@ -1154,6 +1453,7 @@ async fn spawn_console_capture(page: &Page, ring: Arc<Mutex<VecDeque<ConsoleLine
     handles
 }
 
+#[cfg(feature = "browser")]
 fn push_ring<T>(ring: &Mutex<VecDeque<T>>, item: T, cap: usize) {
     if let Ok(mut r) = ring.try_lock() {
         if r.len() >= cap {
@@ -1163,6 +1463,7 @@ fn push_ring<T>(ring: &Mutex<VecDeque<T>>, item: T, cap: usize) {
     }
 }
 
+#[cfg(feature = "browser")]
 #[cfg(feature = "browser")]
 fn push_console(ring: &Mutex<VecDeque<ConsoleLine>>, line: ConsoleLine) {
     push_ring(ring, line, CONSOLE_RING);
@@ -1570,6 +1871,21 @@ impl BrowserStore {
         &self,
         _p: BrowserEvalParams,
     ) -> Result<BrowserEvalResult, BrowserError> {
+        Err(BrowserError::NotAvailable("compiled without the browser feature"))
+    }
+    pub async fn tab_open(&self, _p: TabOpenParams) -> Result<TabOpenResult, BrowserError> {
+        Err(BrowserError::NotAvailable("compiled without the browser feature"))
+    }
+    pub async fn tab_select(&self, _p: TabSelectParams) -> Result<TabSelectResult, BrowserError> {
+        Err(BrowserError::NotAvailable("compiled without the browser feature"))
+    }
+    pub async fn tab_close(&self, _p: TabCloseParams) -> Result<TabCloseResult, BrowserError> {
+        Err(BrowserError::NotAvailable("compiled without the browser feature"))
+    }
+    pub async fn tab_list(&self) -> Result<TabListResult, BrowserError> {
+        Err(BrowserError::NotAvailable("compiled without the browser feature"))
+    }
+    pub async fn mock_set(&self, _p: MockSetParams) -> Result<MockSetResult, BrowserError> {
         Err(BrowserError::NotAvailable("compiled without the browser feature"))
     }
 }

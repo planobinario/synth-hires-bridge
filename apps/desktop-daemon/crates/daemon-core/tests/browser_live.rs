@@ -16,7 +16,8 @@
 use chromiumoxide::detection::{default_executable, DetectionOptions};
 use daemon_core::browser_ops::{
     BrowserActParams, BrowserEvalParams, BrowserLaunchParams, BrowserNavigateParams,
-    BrowserStore, SnapshotParams, WaitParams,
+    BrowserStore, MockRule, MockSetParams, SnapshotParams, TabCloseParams, TabOpenParams,
+    TabSelectParams, WaitParams,
 };
 
 /// Local HTTP server serving `/fixture` (the given body JS) and `/dest`
@@ -607,4 +608,127 @@ fn ref_for_parses_snapshot_markers() {
     assert_eq!(ref_for(snap, "\"go\""), Some(12));
     assert_eq!(ref_for(snap, "absent"), None);
     assert_eq!(ref_for("no markers here", "here"), None);
+}
+
+// ─── Multi-tab + route mocks ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn live_browser_multitab_select_and_close_last_teardown() {
+    if !chrome_available() {
+        println!("browser e2e: skipped (no chrome/chromium/edge)");
+        return;
+    }
+    let store = BrowserStore::new();
+    let (base, _addr) = spawn_fixture_server().await;
+
+    store
+        .launch(BrowserLaunchParams { url: Some(format!("{base}/fixture?tabs=1")), headed: false, size: None })
+        .await
+        .expect("launch (tabs fixture)");
+
+    // Open a second tab whose page announces its own tab id.
+    let opened = store
+        .tab_open(TabOpenParams { url: Some(format!("{base}/dest?tab=second")), tab_id: Some("second".into()) })
+        .await
+        .expect("tab_open");
+    assert_eq!(opened.tab_id, "second");
+    let listed = store.tab_list().await.expect("tab_list after open");
+    assert_eq!(listed.active_tab, "second", "open selects the new tab");
+    assert!(listed.tabs.contains(&"main".to_string()) && listed.tabs.contains(&"second".to_string()));
+
+    // Refs from another tab never leak across a select.
+    store
+        .snapshot(SnapshotParams { limit: None, focus: None, max_nodes: None })
+        .await
+        .expect("snapshot second tab");
+    let sel = store
+        .tab_select(TabSelectParams { tab_id: "main".into() })
+        .await
+        .expect("tab_select main");
+    assert_eq!(sel.active_tab, "main");
+
+    // Closing a non-active tab keeps the session alive.
+    let closed = store
+        .tab_close(TabCloseParams { tab_id: "second".into() })
+        .await
+        .expect("tab_close second");
+    assert!(closed.closed);
+    assert_eq!(closed.active_tab, "main", "active tab survives non-active close");
+    assert!(!closed.tabs.contains(&"second".to_string()));
+
+    // Last tab closed = full teardown: subsequent ops say NoSession.
+    let closed = store
+        .tab_close(TabCloseParams { tab_id: "main".into() })
+        .await
+        .expect("tab_close main");
+    assert_eq!(closed.active_tab, "", "last close ends the session");
+    assert!(store.tab_list().await.is_err(), "session must be gone after last close");
+}
+
+#[tokio::test]
+async fn live_browser_route_mock_serves_locally_and_passes_through() {
+    if !chrome_available() {
+        println!("browser e2e: skipped (no chrome/chromium/edge)");
+        return;
+    }
+    let store = BrowserStore::new();
+    let (base, _addr) = spawn_fixture_server().await;
+
+    store
+        .launch(BrowserLaunchParams { url: Some(format!("{base}/fixture?mock=1")), headed: false, size: None })
+        .await
+        .expect("launch (mock fixture)");
+
+    // Rule 1: /api/mock-me → local 200 with fixed JSON.
+    // Rule 2: /api/boom → local 500. Both WITHOUT touching the fixture server.
+    store
+        .mock_set(MockSetParams {
+            rules: Some(vec![
+                MockRule {
+                    url_contains: "/api/mock-me".into(),
+                    status: 200,
+                    body: r#"{"mocked":true,"value":42}"#.into(),
+                    content_type: Some("application/json".into()),
+                },
+                MockRule {
+                    url_contains: "/api/boom".into(),
+                    status: 500,
+                    body: r#"{"error":"boom"}"#.into(),
+                    content_type: Some("application/json".into()),
+                },
+            ]),
+        })
+        .await
+        .expect("mock_set");
+
+    // eval fetches BOTH mocked URLs and the REAL one (pass-through still
+    // works). The fixture's 404 route serves HTML, so the real request is
+    // checked by status + body shape, not .json().
+    let probe = r#"(async () => {
+        const ok = await (await fetch('/api/mock-me')).json();
+        let boomStatus = 0;
+        try {
+            const r = await fetch('/api/boom');
+            boomStatus = r.status;
+        } catch (e) { boomStatus = -1; }
+        const realR = await fetch('/api-404.json');
+        const realText = await realR.text();
+        return { ok, boomStatus, realStatus: realR.status, realIsHtml: realText.includes('<html') };
+    })()"#;
+
+    let waited = store
+        .wait(WaitParams { timeout_ms: Some(8_000), text: None, sleep_ms: Some(1_200) })
+        .await
+        .expect("wait for fetches");
+    let _ = waited;
+    let result = store
+        .eval(BrowserEvalParams { expression: probe.into() })
+        .await
+        .expect("eval probe");
+    let v = result.value;
+    assert_eq!(v["ok"]["mocked"], serde_json::json!(true), "mocked 200 served locally");
+    assert_eq!(v["ok"]["value"], serde_json::json!(42));
+    assert_eq!(v["boomStatus"], serde_json::json!(500), "mocked 500 reached the page");
+    assert_eq!(v["realStatus"], serde_json::json!(404), "real request passed through (no hang)");
+    assert_eq!(v["realIsHtml"], serde_json::json!(true), "real response body came from the network");
 }

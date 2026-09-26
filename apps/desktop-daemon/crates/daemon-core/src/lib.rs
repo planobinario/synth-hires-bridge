@@ -25,6 +25,7 @@ pub mod git_ops;
 pub mod health;
 pub mod jni_android;
 pub mod lsp_ops;
+pub mod mcp_ops;
 pub mod memory_store;
 pub mod keyring;
 pub mod os_info;

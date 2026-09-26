@@ -91,6 +91,7 @@ pub struct WsClient {
     pty: Arc<crate::pty_ops::PtyEngine>,
     browser: Arc<crate::browser_ops::BrowserStore>,
     dap: Arc<crate::dap_ops::DapEngine>,
+    mcp: Arc<crate::mcp_ops::McpStore>,
     chat_store: Arc<ChatStore>,
     _consent: Arc<ConsentBroker>,
     health: Arc<WsHealth>,
@@ -127,6 +128,7 @@ impl WsClient {
             pty: Arc::new(crate::pty_ops::PtyEngine::new(gate.clone())),
             browser: Arc::new(crate::browser_ops::BrowserStore::new()),
             dap: Arc::new(crate::dap_ops::DapEngine::new(gate.clone())),
+            mcp: Arc::new(crate::mcp_ops::McpStore::new()),
             memory: Arc::new(
                 crate::memory_store::MemoryStore::open(crate::memory_store::MemoryStore::default_path())
                     .unwrap_or_else(|e| {
@@ -223,6 +225,7 @@ impl WsClient {
                 "pty".to_string(),
                 "browser".to_string(),
                 "dap".to_string(),
+                "mcp".to_string(),
                 "tools".to_string(),
             ],
             // One-shot manifest of tools already on the machine (CLI + LSP
@@ -339,8 +342,20 @@ impl WsClient {
             "desktop.browser.act" => "desktop.shell.execute",
             "desktop.browser.snapshot" | "desktop.browser.shot" | "desktop.browser.wait"
             | "desktop.browser.close" | "desktop.browser.eval" => "desktop.fs.read",
+            // Multi-tab lifecycle rides nav's network tier; listing tabs is a
+            // read. Route mocks intercept network traffic -> network tier.
+            "desktop.browser.tab_open" | "desktop.browser.tab_select" | "desktop.browser.tab_close"
+            | "desktop.browser.mock_set" => "desktop.network.fetch",
+            "desktop.browser.tab_list" => "desktop.fs.read",
             // Debugger: start/eval/flow-control are as powerful as a shell;
             // inspection ops (breakpoints, stack, variables, threads) are reads.
+            // MCP: status is a read; spawning/listing/calling a server is as
+            // powerful as a shell; stopping one is the kill tier.
+            "desktop.mcp.op" => match request.params.get("op").and_then(|v| v.as_str()) {
+                Some("status") => "desktop.fs.read",
+                Some("stop") => "desktop.process.kill",
+                _ => "desktop.shell.execute",
+            }
             "desktop.debug.op" => match request.params.get("op").and_then(|v| v.as_str()) {
                 Some("start") | Some("eval") | Some("continue") | Some("step") | Some("pause") => {
                     "desktop.shell.execute"
@@ -637,9 +652,40 @@ impl WsClient {
                     self.dap.execute(value).await
                 })
             }
+            "desktop.mcp.op" => {
+                dispatch_op!(self, ws, request, started, value, req, crate::mcp_ops::McpOp, {
+                    value.execute(&self.mcp).await
+                })
+            }
             "desktop.browser.close" => {
                 dispatch_op!(self, ws, request, started, value, req, crate::browser_ops::BrowserCloseParams, {
                     self.browser.close(value.kill).await
+                })
+            }
+            "desktop.browser.tab_open" => {
+                dispatch_op!(self, ws, request, started, value, req, crate::browser_ops::TabOpenParams, {
+                    self.browser.tab_open(value).await
+                })
+            }
+            "desktop.browser.tab_select" => {
+                dispatch_op!(self, ws, request, started, value, req, crate::browser_ops::TabSelectParams, {
+                    self.browser.tab_select(value).await
+                })
+            }
+            "desktop.browser.tab_close" => {
+                dispatch_op!(self, ws, request, started, value, req, crate::browser_ops::TabCloseParams, {
+                    self.browser.tab_close(value).await
+                })
+            }
+            "desktop.browser.tab_list" => {
+                dispatch_op!(self, ws, request, started, value, req, serde_json::Value, {
+                    let _ = value;
+                    self.browser.tab_list().await
+                })
+            }
+            "desktop.browser.mock_set" => {
+                dispatch_op!(self, ws, request, started, value, req, crate::browser_ops::MockSetParams, {
+                    self.browser.mock_set(value).await
                 })
             }
             "desktop.git.overview" => {
