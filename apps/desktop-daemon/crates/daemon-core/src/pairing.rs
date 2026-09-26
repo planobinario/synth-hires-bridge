@@ -93,21 +93,64 @@ impl<'a> PairingFlow<'a> {
             .json()
             .await
             .map_err(|e| crate::DaemonError::Protocol(format!("pair/complete decode: {e}")))?;
-        let ws_url = if body.data.ws_url.starts_with("ws://") || body.data.ws_url.starts_with("wss://") {
-            body.data.ws_url.clone()
-        } else {
-            let origin = self
-                .backend_url
-                .trim_end_matches('/')
-                .replace("https://", "wss://")
-                .replace("http://", "ws://");
-            format!("{}{}", origin, body.data.ws_url)
-        };
+        let ws_url = ws_endpoint_for_origin(&self.backend_url, &body.data.ws_url);
         TokenStore::save(&body.data.device_id, &body.data.token)?;
         Ok(PairCompleteResponse {
             data: PairCompleteData { ws_url, ..body.data },
             success: body.success,
         })
+    }
+}
+
+/// Builds the WebSocket endpoint the WS client dials: if the server already
+/// returned an absolute ws:// / wss:// URL, use it verbatim; otherwise join
+/// the (possibly http/https) origin with the path, converting the scheme.
+///
+/// Shared with the CLI so the STARTUP path (state.backend_url persisted as a
+/// plain origin) normalizes the same way — feeding `http://` straight into
+/// tungstenite fails with "URL scheme not supported" and a restarted daemon
+/// could never reconnect (found by the paired-daemon E2E).
+pub fn ws_endpoint_for_origin(backend_origin: &str, ws_path: &str) -> String {
+    if ws_path.starts_with("ws://") || ws_path.starts_with("wss://") {
+        return ws_path.to_string();
+    }
+    let origin = backend_origin
+        .trim_end_matches('/')
+        .replace("https://", "wss://")
+        .replace("http://", "ws://");
+    format!("{origin}{}", ws_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ws_endpoint_converts_http_origins() {
+        assert_eq!(
+            ws_endpoint_for_origin("http://127.0.0.1:4331", "/api/devices/ws"),
+            "ws://127.0.0.1:4331/api/devices/ws"
+        );
+        assert_eq!(
+            ws_endpoint_for_origin("https://synthhires.com", "/api/devices/ws"),
+            "wss://synthhires.com/api/devices/ws"
+        );
+        assert_eq!(
+            ws_endpoint_for_origin("http://host/", "/api/devices/ws"),
+            "ws://host/api/devices/ws"
+        );
+    }
+
+    #[test]
+    fn ws_endpoint_keeps_absolute_ws_urls() {
+        assert_eq!(
+            ws_endpoint_for_origin("http://ignored", "ws://a/b"),
+            "ws://a/b"
+        );
+        assert_eq!(
+            ws_endpoint_for_origin("http://ignored", "wss://a/b"),
+            "wss://a/b"
+        );
     }
 }
 

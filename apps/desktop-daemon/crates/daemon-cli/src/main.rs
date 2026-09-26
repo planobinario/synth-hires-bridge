@@ -819,7 +819,15 @@ async fn background_daemon_task(
             let s = state.read().await;
             s.backend_url.clone()
         };
-        let ws_backend = saved_url.unwrap_or(backend_url.clone());
+        // The state stores a plain origin (http/https). Normalize to a ws(s)://
+        // endpoint here — feeding `http://` into tungstenite fails with "URL
+        // scheme not supported" and a restarted daemon could never reconnect
+        // (found by the paired-daemon E2E).
+        let ws_backend = saved_url
+            .map(|origin| {
+                daemon_core::pairing::ws_endpoint_for_origin(&origin, "/api/devices/ws")
+            })
+            .unwrap_or_else(|| backend_url.clone());
         let status_tx_clone = status_tx.clone();
         let ws_store = chat_store.clone();
         let ws_consent = consent.clone();
