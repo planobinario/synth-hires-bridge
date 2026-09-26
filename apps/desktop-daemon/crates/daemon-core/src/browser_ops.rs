@@ -616,6 +616,16 @@ impl BrowserStore {
         };
         session.tabs.insert(tab_id.clone(), page.clone());
         session.active_tab = tab_id.clone();
+        // Interception is per-target in CDP: a tab opened while mocks are
+        // armed needs its OWN listener (sharing the same live rule set).
+        if session.mock_listener_armed {
+            let mocks = session.mocks.clone();
+            if let Err(e) =
+                Self::arm_page_interception(mocks, &page, &mut session.background).await
+            {
+                tracing::warn!(error = %e, tab = %tab_id, "mock arm on new tab failed");
+            }
+        }
         // Rebind the session's active page/refs so existing verbs act HERE.
         session.page = page;
         session.refs = HashMap::new();
@@ -727,66 +737,96 @@ impl BrowserStore {
             if rules.is_empty() {
                 return Ok(MockSetResult { active_rules: 0 });
             }
-            let pattern = RequestPattern::builder().url_pattern("*").build();
-            session
-                .page
-                .execute(FetchEnable::builder().pattern(pattern).build())
-                .await
-                .map_err(|e| BrowserError::Cdp(format!("mock enable: {e}")))?;
-            // The listener serves from the SHARED rule set and CONTINUES
-            // everything unmatched — a paused request nobody answers hangs
-            // the page forever, which is worse than an unmapped mock.
-            let rules_shared = session.mocks.clone();
-            let listener = session.page.event_listener::<EventRequestPaused>().await;
-            let page = session.page.clone();
-            let handle = tokio::spawn(async move {
-                if let Ok(mut stream) = listener {
-                    while let Some(ev) = futures_util::StreamExt::next(&mut stream).await {
-                        let matched = {
-                            let guard = rules_shared.lock().unwrap();
-                            guard
-                                .iter()
-                                .find(|r| !r.url_contains.is_empty() && ev.request.url.contains(&r.url_contains))
-                                .cloned()
-                        };
-                        if let Some(rule) = matched {
-                            let header = HeaderEntry::new(
-                                "content-type",
-                                rule.content_type
-                                    .clone()
-                                    .unwrap_or_else(|| "application/json".to_string()),
-                            );
-                            use base64::Engine as _;
-                            let body_b64 =
-                                base64::engine::general_purpose::STANDARD.encode(rule.body.as_bytes());
-                            match FulfillRequestParams::builder()
-                                .request_id(ev.request_id.clone())
-                                .response_code(rule.status as i64)
-                                .response_header(header)
-                                .body(body_b64)
-                                .build()
-                            {
-                                Ok(params) => {
-                                    let _ = page.execute(params).await;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "mock fulfill build failed");
-                                }
-                            }
-                        } else if let Ok(params) =
-                            ContinueRequestParams::builder().request_id(ev.request_id.clone()).build()
-                        {
-                            let _ = page.execute(params).await;
-                        }
+            // Arm EVERY page of the session: Fetch interception is
+            // per-target in CDP, and a listener bound only to the page
+            // active at arm time leaves every other tab unmocked (and
+            // vice versa) — caught live by the paired E2E: top-frame nav
+            // on `main` served the REAL 404 while armed on the active tab.
+            let mocks = session.mocks.clone();
+            let pages: Vec<Page> = session.tabs.values().cloned().collect();
+            let mut failures: usize = 0;
+            let mut first_err: Option<BrowserError> = None;
+            for page in &pages {
+                if let Err(e) =
+                    Self::arm_page_interception(mocks.clone(), page, &mut session.background).await
+                {
+                    failures += 1;
+                    if first_err.is_none() {
+                        first_err = Some(e);
                     }
                 }
-            });
-            session.background.push(handle);
+            }
+            if failures == pages.len() && failures > 0 {
+                return Err(first_err.expect("at least one failure"));
+            }
             session.mock_listener_armed = true;
         }
         Ok(MockSetResult {
             active_rules: rules.len(),
         })
+    }
+
+    /// Arm the Fetch interception listener on ONE page. The listener
+    /// serves from the SHARED rule set (live updates, no stacking of rule
+    /// copies) and CONTINUES everything unmatched — a paused request
+    /// nobody answers hangs the page forever, which is worse than an
+    /// unmapped mock. Called for every existing tab on the first
+    /// mock_set and for each tab opened while armed (per-target enable).
+    async fn arm_page_interception(
+        mocks: std::sync::Arc<std::sync::Mutex<Vec<MockRule>>>,
+        page: &Page,
+        background: &mut Vec<tokio::task::JoinHandle<()>>,
+    ) -> Result<(), BrowserError> {
+        let pattern = RequestPattern::builder().url_pattern("*").build();
+        page.execute(FetchEnable::builder().pattern(pattern).build())
+            .await
+            .map_err(|e| BrowserError::Cdp(format!("mock enable: {e}")))?;
+        let listener = page.event_listener::<EventRequestPaused>().await;
+        let page = page.clone();
+        let handle = tokio::spawn(async move {
+            if let Ok(mut stream) = listener {
+                while let Some(ev) = futures_util::StreamExt::next(&mut stream).await {
+                    let matched = {
+                        let guard = mocks.lock().unwrap();
+                        guard
+                            .iter()
+                            .find(|r| !r.url_contains.is_empty() && ev.request.url.contains(&r.url_contains))
+                            .cloned()
+                    };
+                    if let Some(rule) = matched {
+                        let header = HeaderEntry::new(
+                            "content-type",
+                            rule.content_type
+                                .clone()
+                                .unwrap_or_else(|| "application/json".to_string()),
+                        );
+                        use base64::Engine as _;
+                        let body_b64 =
+                            base64::engine::general_purpose::STANDARD.encode(rule.body.as_bytes());
+                        match FulfillRequestParams::builder()
+                            .request_id(ev.request_id.clone())
+                            .response_code(rule.status as i64)
+                            .response_header(header)
+                            .body(body_b64)
+                            .build()
+                        {
+                            Ok(params) => {
+                                let _ = page.execute(params).await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "mock fulfill build failed");
+                            }
+                        }
+                    } else if let Ok(params) =
+                        ContinueRequestParams::builder().request_id(ev.request_id.clone()).build()
+                    {
+                        let _ = page.execute(params).await;
+                    }
+                }
+            }
+        });
+        background.push(handle);
+        Ok(())
     }
 
     // -- snapshot ----------------------------------------------------------
@@ -1577,7 +1617,7 @@ fn console_args_text(ev: &Value) -> String {
 /// `window.open` entirely (confirmed by the live E2E in
 /// `tests/browser_live.rs`). Real navigation, so `beforeunload` handlers
 /// still get to run; returning `null` matches the spec for a blocked popup.
-#[cfg(feature = "browser")]
+#[cfg_attr(not(feature = "browser"), allow(dead_code))]
 const POPUP_GUARD_JS: &str = r#"(() => {
   const realOpen = window.open.bind(window);
   window.open = (url, target, features) => {
@@ -2039,7 +2079,7 @@ mod tests {
     async fn stub_reports_unavailable() {
         let store = BrowserStore::new();
         let err = store
-            .snapshot(SnapshotParams { limit: None })
+            .snapshot(SnapshotParams { limit: None, focus: None, max_nodes: None })
             .await
             .unwrap_err();
         assert!(matches!(err, BrowserError::NotAvailable(_)));

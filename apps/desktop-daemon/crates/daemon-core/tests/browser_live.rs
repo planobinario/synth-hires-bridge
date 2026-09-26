@@ -732,3 +732,65 @@ async fn live_browser_route_mock_serves_locally_and_passes_through() {
     assert_eq!(v["realStatus"], serde_json::json!(404), "real request passed through (no hang)");
     assert_eq!(v["realIsHtml"], serde_json::json!(true), "real response body came from the network");
 }
+
+// Regression for the live paired E2E (2026-09-26): launch → tab_open →
+// mock_set → TOP-FRAME nav on `main` served the REAL 404 instead of the
+// rule. Sub-resource fetches on the armed page passed (existing test
+// above); top-frame navigation after the page object was rebound through
+// tab management did not. This test reproduces that exact order and
+// FAILS while the interception is bound to a stale page object.
+#[tokio::test]
+async fn live_browser_mock_survives_tab_open_then_top_frame_nav() {
+    if !chrome_available() {
+        println!("browser e2e: skipped (no chrome/chromium/edge)");
+        return;
+    }
+    let store = BrowserStore::new();
+    let (base, _addr) = spawn_fixture_server().await;
+
+    store
+        .launch(BrowserLaunchParams { url: Some(format!("{base}/fixture?mock=1")), headed: false, size: None })
+        .await
+        .expect("launch");
+
+    // Same order as the failing E2E: new tab (rebinds session.page), THEN
+    // arm the rules, THEN top-frame navigate the original tab.
+    store
+        .tab_open(TabOpenParams { url: None, tab_id: None })
+        .await
+        .expect("tab_open");
+
+    store
+        .mock_set(MockSetParams {
+            rules: Some(vec![MockRule {
+                url_contains: "/mock-e2e-top".into(),
+                status: 200,
+                body: r#"{"mocked":true,"kind":"top-frame"}"#.into(),
+                content_type: Some("application/json".into()),
+            }]),
+        })
+        .await
+        .expect("mock_set");
+
+    store
+        .tab_select(TabSelectParams { tab_id: "main".into() })
+        .await
+        .expect("tab_select main");
+
+    store
+        .navigate(BrowserNavigateParams { url: format!("{base}/mock-e2e-top?cb=1") })
+        .await
+        .expect("top-frame nav on main");
+
+    let v = store
+        .eval(BrowserEvalParams {
+            expression: "document.body ? document.body.innerText : ''".into(),
+        })
+        .await
+        .expect("eval body");
+    let body = v.value.as_str().unwrap_or_default();
+    assert!(
+        body.contains("top-frame"),
+        "top-frame nav must be served by the route mock after tab_open+arm; got: {body}"
+    );
+}
