@@ -223,7 +223,12 @@ impl WsClient {
                 "pty".to_string(),
                 "browser".to_string(),
                 "dap".to_string(),
+                "tools".to_string(),
             ],
+            // One-shot manifest of tools already on the machine (CLI + LSP
+            // servers + debug adapters). v1.1: serde-defaulted in the
+            // protocol, so older webs ignore it and nothing breaks.
+            tools: crate::tools_probe::detect_tools().await,
         });
         ws.send(Message::Text(serde_json::to_string(&hello)?))
             .await
@@ -311,7 +316,11 @@ impl WsClient {
                 "desktop.fs.read"
             }
             "desktop.memory.recall" | "desktop.memory.stats" => "desktop.fs.read",
+            // Tool manifest: versions of user-installed CLIs/LSP/DAP tools.
+            // A read of the environment, nothing executable is run by THIS op
+            // (the one-shot --version probes run once per process at hello).
             "desktop.git.overview" | "desktop.git.diff" => "desktop.fs.read",
+            "desktop.tools.manifest" => "desktop.fs.read",
             "desktop.memory.remember" | "desktop.memory.forget" | "desktop.memory.reflect" => {
                 "desktop.fs.write"
             }
@@ -638,6 +647,14 @@ impl WsClient {
                     crate::git_ops::GitOps::new(&*self.gate.lock().await)
                         .overview(value)
                         .await
+                })
+            }
+            "desktop.tools.manifest" => {
+                dispatch_op!(self, ws, request, started, value, req, serde_json::Value, {
+                    let _ = value;
+                    Ok::<serde_json::Value, DaemonError>(serde_json::json!({
+                        "tools": crate::tools_probe::detect_tools().await,
+                    }))
                 })
             }
             "desktop.git.diff" => {

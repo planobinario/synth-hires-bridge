@@ -60,6 +60,34 @@ pub struct HelloFrame {
     /// BRIDGE_FEATURES (src/lib/agent/bridge-protocol.ts).
     #[serde(default)]
     pub features: Vec<String>,
+    /// One-shot manifest of tools already on the user's machine (CLIs,
+    /// language servers, debug adapters — daemon-core/tools_probe.rs).
+    /// Protocol v1.1: serde-defaulted, older webs ignore it. Empty/missing
+    /// means "unknown", never "absent" — consumers must not gate features
+    /// off a missing field, only off an explicit probe result.
+    #[serde(default)]
+    pub tools: Vec<crate::ToolProbe>,
+}
+
+/// One probed tool (protocol v1.1). Keep in lockstep with the web's
+/// BridgeToolProbe (src/lib/agent/bridge-protocol.ts).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolProbe {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub kind: crate::ToolsProbeKind,
+}
+
+/// What the probed tool powers (mirrors tools_probe::ToolKind).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolsProbeKind {
+    Shell,
+    Vcs,
+    Lsp,
+    Dap,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

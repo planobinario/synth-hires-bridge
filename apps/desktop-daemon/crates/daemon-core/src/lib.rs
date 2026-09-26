@@ -32,6 +32,7 @@ pub mod pairing;
 pub mod proc_ops;
 pub mod pty_ops;
 pub mod shell;
+pub mod tools_probe;
 pub mod system_ops;
 pub mod task_registry;
 pub mod ws_client;
