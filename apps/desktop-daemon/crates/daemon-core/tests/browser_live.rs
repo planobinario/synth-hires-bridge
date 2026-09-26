@@ -269,11 +269,11 @@ async fn live_browser_dialogs_do_not_freeze_and_popups_stay_in_session() {
     // The snapshot itself proves the page is not frozen (GetFullAxTree runs
     // in the page and would not answer while a dialog is open).
     let snap = store
-        .snapshot(SnapshotParams { limit: None })
+        .snapshot(SnapshotParams { limit: None, focus: None, max_nodes: None })
         .await
         .expect("snapshot must answer — the page is not stalled by dialogs");
     let snap2 = store
-        .snapshot(SnapshotParams { limit: None })
+        .snapshot(SnapshotParams { limit: None, focus: None, max_nodes: None })
         .await
         .expect("second snapshot");
 
@@ -375,7 +375,7 @@ async fn live_browser_verbs_eval_network_and_history() {
         .expect("launch (verbs fixture)");
 
     let snap = store
-        .snapshot(SnapshotParams { limit: None })
+        .snapshot(SnapshotParams { limit: None, focus: None, max_nodes: None })
         .await
         .expect("snapshot for refs");
     let hover_ref = ref_for(&snap.text, "hover-target").expect("hover-target must carry a ref");
@@ -466,7 +466,7 @@ async fn live_browser_verbs_eval_network_and_history() {
         && !(net.contains("api-404.json") && net.contains("img-404.png"))
     {
         let s = store
-            .snapshot(SnapshotParams { limit: None })
+            .snapshot(SnapshotParams { limit: None, focus: None, max_nodes: None })
             .await
             .expect("net snapshot");
         for n in &s.network {
@@ -536,13 +536,56 @@ async fn live_browser_verbs_eval_network_and_history() {
         .await
         .expect("reload dispatches");
     let after_reload = store
-        .snapshot(SnapshotParams { limit: None })
+        .snapshot(SnapshotParams { limit: None, focus: None, max_nodes: None })
         .await
         .expect("snapshot after reload");
     assert_eq!(
         after_reload.title.as_deref(),
         Some("opened"),
         "reload must re-serve the current page"
+    );
+
+    // -- 4. Narrow-down: focus slices the tree and reports the match.
+    store
+        .navigate(BrowserNavigateParams { url: format!("{base}/fixture?verbos=1") })
+        .await
+        .expect("navigate to verbos for focus");
+    let full = store
+        .snapshot(SnapshotParams { limit: None, focus: None, max_nodes: None })
+        .await
+        .expect("full snapshot");
+    let focused = store
+        .snapshot(SnapshotParams {
+            limit: None,
+            focus: Some("hover-target".into()),
+            max_nodes: Some(60),
+        })
+        .await
+        .expect("focused snapshot");
+    assert_eq!(
+        focused.focus_matched,
+        Some(full.node_count),
+        "focus must report the total node count when the needle matches"
+    );
+    assert!(
+        focused.text.contains("hover-target"),
+        "the focused window must contain the needle"
+    );
+    assert!(
+        focused.text.lines().count() <= full.text.lines().count(),
+        "the focused window must not be larger than the full snapshot"
+    );
+    let miss = store
+        .snapshot(SnapshotParams {
+            limit: None,
+            focus: Some("no-such-node-xyz".into()),
+            max_nodes: None,
+        })
+        .await
+        .expect("missed focus snapshot");
+    assert!(
+        miss.focus_matched.is_none(),
+        "a needle that matches nothing must report focus_matched: None"
     );
 
     store.close(true).await.expect("close");

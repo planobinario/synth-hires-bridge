@@ -133,6 +133,14 @@ pub struct SnapshotParams {
     /// Max nodes in the snapshot (safety cap). Default 350.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Narrow-down: start the window at the node whose name/value contains
+    /// this text (case-insensitive). The window keeps a few preceding nodes
+    /// for context. Empty match → full tree from the top.
+    #[serde(default)]
+    pub focus: Option<String>,
+    /// Node budget for the focused window. Default 350, clamped 30..=2000.
+    #[serde(default)]
+    pub max_nodes: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,6 +157,10 @@ pub struct SnapshotResult {
     /// in the agent's mind — 4xx/5xx, aborted loads — plus what actually ran.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub network: Vec<NetworkLine>,
+    /// `Some(node_count_total)` when a `focus` window was applied (the
+    /// snapshot covers a slice of the tree, not it all). Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus_matched: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -461,7 +473,7 @@ impl BrowserStore {
             .wait_for_navigation()
             .await
             .map_err(|e| BrowserError::Cdp(format!("wait navigation: {e}")))?;
-        self.snapshot_inner(session, 350).await
+        self.snapshot_inner(session, 350, None, None).await
     }
 
     pub async fn navigate(
@@ -485,13 +497,16 @@ impl BrowserStore {
     pub async fn snapshot(&self, p: SnapshotParams) -> Result<SnapshotResult, BrowserError> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions.get_mut(Self::SESSION).ok_or(BrowserError::NoSession)?;
-        self.snapshot_inner(session, p.limit.unwrap_or(350)).await
+        self.snapshot_inner(session, p.limit.unwrap_or(350), p.focus.as_deref(), p.max_nodes)
+            .await
     }
 
     async fn snapshot_inner(
         &self,
         session: &mut BrowserSession,
         limit: usize,
+        focus: Option<&str>,
+        focus_budget: Option<usize>,
     ) -> Result<SnapshotResult, BrowserError> {
         // Fresh AX tree.
         let res = session
@@ -520,10 +535,43 @@ impl BrowserStore {
         };
 
         // Serialize nodes to JSON once — extraction becomes shape-safe.
-        let serialized: Vec<Value> = nodes
+        let mut serialized: Vec<Value> = nodes
             .iter()
             .filter_map(|node| serde_json::to_value(node).ok())
             .collect();
+
+        // Narrow-down: slice the tree so the agent can iterate over sections
+        // instead of paying for the whole page (the OMP "iterate narrow-down"
+        // habit). The window keeps a few preceding nodes for context.
+        let mut focus_matched: Option<usize> = None;
+        if let Some(needle) = focus.map(|f| f.trim()).filter(|f| !f.is_empty()) {
+            let lower = needle.to_lowercase();
+            let hit = serialized.iter().position(|v| {
+                if v.get("ignored").and_then(Value::as_bool).unwrap_or(false) {
+                    return false;
+                }
+                for key in ["name", "value"] {
+                    if let Some(s) = v
+                        .pointer(&format!("/{key}/value"))
+                        .and_then(Value::as_str)
+                        .map(|s| s.to_lowercase())
+                    {
+                        if s.contains(&lower) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            });
+            if let Some(idx) = hit {
+                let budget = focus_budget.unwrap_or(350).clamp(30, 2_000);
+                let start = idx.saturating_sub(5);
+                focus_matched = Some(nodes.len());
+                serialized = serialized.into_iter().skip(start).take(budget).collect();
+            }
+            // No hit → fall through with the full tree; the caller sees
+            // focus_matched: None and knows the needle did not land.
+        }
 
         // Hierarchy pass: one O(n) sweep builds the parent maps, then a
         // memoized climb yields the TRUE tree depth per node (real indent,
@@ -616,6 +664,7 @@ impl BrowserStore {
             text: out,
             console,
             network,
+            focus_matched,
         })
     }
 
@@ -669,7 +718,7 @@ impl BrowserStore {
 
         // Small settle delay, then a fresh snapshot to verify.
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        let snapshot = self.snapshot_inner(session, 350).await?;
+        let snapshot = self.snapshot_inner(session, 350, None, None).await?;
         Ok(BrowserActResult { ok: true, snapshot })
     }
 
@@ -988,12 +1037,12 @@ impl BrowserStore {
             loop {
                 if self.ax_tree_contains(needle).await? {
                     let waited = started.elapsed().as_millis() as u64;
-                    let snapshot = self.snapshot(SnapshotParams { limit: Some(600) }).await?;
+                    let snapshot = self.snapshot(SnapshotParams { limit: Some(600), focus: None, max_nodes: None }).await?;
                     return Ok(WaitResult { matched: true, waited_ms: waited, snapshot: Some(snapshot) });
                 }
                 if started.elapsed().as_millis() as u64 >= timeout {
                     let waited = started.elapsed().as_millis() as u64;
-                    let snapshot = self.snapshot(SnapshotParams { limit: Some(600) }).await?;
+                    let snapshot = self.snapshot(SnapshotParams { limit: Some(600), focus: None, max_nodes: None }).await?;
                     return Ok(WaitResult { matched: false, waited_ms: waited, snapshot: Some(snapshot) });
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -1002,7 +1051,9 @@ impl BrowserStore {
 
         tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
         let waited = started.elapsed().as_millis() as u64;
-        let snapshot = self.snapshot(SnapshotParams { limit: Some(600) }).await?;
+        let snapshot = self
+            .snapshot(SnapshotParams { limit: Some(600), focus: None, max_nodes: None })
+            .await?;
         Ok(WaitResult { matched: true, waited_ms: waited, snapshot: Some(snapshot) })
     }
 
