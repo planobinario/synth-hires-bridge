@@ -7,6 +7,12 @@
 //!
 //! All fields are cheap to read concurrently: atomics + one mutex for
 //! the last error string.
+//!
+//! Zombie-watchdog counters: `heartbeat_acks` counts acks received since
+//! process start, `stale_heartbeats` counts heartbeats that timed out
+//! without an ack. A healthy connection is dominated by acks; a zombie
+//! (TCP open, server gone) is dominated by stales. Exposed so ops can
+//! verify the watchdog actually fired instead of guessing from logs.
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,6 +26,8 @@ pub struct WsHealthSnapshot {
     pub last_heartbeat_ack_at_ms: u64,
     pub last_rtt_ms: u64,
     pub reconnects: u64,
+    pub heartbeat_acks: u64,
+    pub stale_heartbeats: u64,
     pub last_error: String,
 }
 
@@ -30,6 +38,8 @@ pub struct WsHealth {
     last_heartbeat_ack_at: AtomicU64,
     last_rtt_ms: AtomicU64,
     reconnects: AtomicU64,
+    heartbeat_acks: AtomicU64,
+    stale_heartbeats: AtomicU64,
     last_error: Mutex<String>,
 }
 
@@ -42,6 +52,8 @@ impl WsHealth {
             last_heartbeat_ack_at: AtomicU64::new(0),
             last_rtt_ms: AtomicU64::new(0),
             reconnects: AtomicU64::new(0),
+            heartbeat_acks: AtomicU64::new(0),
+            stale_heartbeats: AtomicU64::new(0),
             last_error: Mutex::new(String::new()),
         }
     }
@@ -59,10 +71,19 @@ impl WsHealth {
     }
 
     pub fn mark_heartbeat_ack(&self, sent_at_ms: u64) {
+        self.heartbeat_acks.fetch_add(1, Ordering::Relaxed);
         let now = now_ms();
         self.last_heartbeat_ack_at.store(now, Ordering::Relaxed);
         self.last_rtt_ms
             .store(now.saturating_sub(sent_at_ms), Ordering::Relaxed);
+    }
+
+    /// One heartbeat sent over the wire never got its ack. Observable,
+    /// monotonic evidence for the zombie watchdog — not a verdict by itself
+    /// (the first beat can straddle a hello_ack), but it must never be
+    /// silently dropped.
+    pub fn mark_heartbeat_stale(&self) {
+        self.stale_heartbeats.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn set_error(&self, msg: &str) {
@@ -79,6 +100,8 @@ impl WsHealth {
             last_heartbeat_ack_at_ms: self.last_heartbeat_ack_at.load(Ordering::Relaxed),
             last_rtt_ms: self.last_rtt_ms.load(Ordering::Relaxed),
             reconnects: self.reconnects.load(Ordering::Relaxed),
+            heartbeat_acks: self.heartbeat_acks.load(Ordering::Relaxed),
+            stale_heartbeats: self.stale_heartbeats.load(Ordering::Relaxed),
             last_error: self
                 .last_error
                 .lock()

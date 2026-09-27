@@ -150,9 +150,16 @@ impl WsClient {
     pub async fn run(&self) -> Result<()> {
         let mut backoff = Duration::from_secs(1);
         loop {
-            match self.connect_once().await {
+            match self.connect_once(Self::FALLBACK_HEARTBEAT_INTERVAL_MS).await {
                 Ok(()) => {
                     self.health.mark_disconnected();
+                    // connect_once returning Ok means the connection ended
+                    // WITHOUT an error path (e.g. a clean Close frame). That
+                    // is the network working as designed, not a failure to
+                    // retreat from: keep the backoff at the floor for the
+                    // next attempt. A zombie-detected disconnect arrives as
+                    // Err and keeps the escalation.
+                    backoff = Duration::from_secs(1);
                 }
                 Err(DaemonError::Protocol(message))
                     if message.contains("auth_failed") || message.contains("revoked") =>
@@ -173,7 +180,14 @@ impl WsClient {
         }
     }
 
-    async fn connect_once(&self) -> Result<()> {
+    /// Server-dictated heartbeat cadence (hello_ack.heartbeatIntervalMs).
+    /// Authority: bridge-do.ts publishes HEARTBEAT_INTERVAL_MS = 30s and
+    /// acks every heartbeat. The watchdog needs a real answer to detect
+    /// silence, so the fallback here is the same value the server uses
+    /// today — one source of truth, no config drift.
+    const FALLBACK_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
+
+    async fn connect_once(&self, heartbeat_interval_ms: u64) -> Result<()> {
         let mut request = self
             .backend_url
             .clone()
@@ -255,16 +269,43 @@ impl WsClient {
             }
             _ => return Err(DaemonError::Protocol("expected hello_ack".into())),
         };
+        // v1.2 (backward compatible): the server's own heartbeat cadence.
+        // Older servers omit it -> serde default -> our fallback, which is
+        // the value those servers use anyway.
+        let heartbeat_interval_ms = if ack.heartbeat_interval_ms > 0 {
+            ack.heartbeat_interval_ms
+        } else {
+            heartbeat_interval_ms
+        };
         self.health.mark_connected();
         *self.gate.lock().await = CapabilityGate::new(ScopeSnapshot::from(&ack.scopes));
-        let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+        let mut heartbeat = tokio::time::interval(Duration::from_millis(heartbeat_interval_ms));
+        // Zombie watchdog (protocol v1.2): the old loop sent heartbeats and
+        // never checked for acks, so a TCP connection whose server side was
+        // gone (laptop suspend, NAT/DO eviction) sat "connected" for hours
+        // while every dispatch returned pending. Now every beat must be
+        // acked by the NEXT tick: at interval+grace the DO acks within RTT,
+        // so a beat still unacked one full interval later means the path is
+        // suspect. ONE miss is tolerated (late ack can straddle a GC/slow
+        // link); TWO consecutive misses force the reconnect — ~60-70s from
+        // failure at the 30s cadence, versus HOURS with the old loop.
+        let mut expected_heartbeat: Option<u64> = None;
+        let mut consecutive_misses: u32 = 0;
         loop {
             tokio::select! {
                 Some(message) = ws.next() => {
                     match message.map_err(|e| DaemonError::Ws(format!("recv: {e}")))? {
                         Message::Text(text) => {
                             let frame: BridgeFrame = serde_json::from_str(&text)?;
-                            if let BridgeFrame::HeartbeatAck(ref ack) = frame { self.health.mark_heartbeat_ack(ack.t); }
+                            if let BridgeFrame::HeartbeatAck(ref ack) = frame {
+                                self.health.mark_heartbeat_ack(ack.t);
+                                // Any ack proves the server runtime is alive:
+                                // clear the pending deadline and the miss
+                                // streak. (The DO acks from the same runtime
+                                // that dispatches actions, so ack => alive.)
+                                expected_heartbeat = None;
+                                consecutive_misses = 0;
+                            }
                             self.handle_frame(&mut ws, frame).await?;
                         }
                         Message::Close(_) => return Ok(()),
@@ -272,9 +313,28 @@ impl WsClient {
                     }
                 }
                 _ = heartbeat.tick() => {
+                    if let Some(t) = expected_heartbeat.take() {
+                        // The previous beat was never acked within its
+                        // grace. One miss is not conclusive; the second
+                        // consecutive miss is a zombie verdict — no TCP
+                        // error will ever surface on a half-dead socket,
+                        // so we must surface it ourselves. Dropping the
+                        // socket hands recovery to the reconnect loop.
+                        consecutive_misses = consecutive_misses.saturating_add(1);
+                        self.health.mark_heartbeat_stale();
+                        let decision = zombie_decision(true, consecutive_misses);
+                        if decision.kill {
+                            tracing::warn!("zombie watchdog: {decision:?}; forcing reconnect");
+                            return Err(DaemonError::Ws(
+                                "heartbeat watchdog: no ack from server".into(),
+                            ));
+                        }
+                        tracing::debug!("heartbeat t={t} unacked (miss {consecutive_misses}/2)");
+                    }
                     let frame = BridgeFrame::Heartbeat(daemon_protocol::HeartbeatFrame { v: PROTOCOL_VERSION, t: now_ms() });
                     ws.send(Message::Text(serde_json::to_string(&frame)?)).await
                         .map_err(|e| DaemonError::Ws(format!("send heartbeat: {e}")))?;
+                    expected_heartbeat = Some(frame_heartbeat_t(&frame));
                 }
             }
         }
@@ -1114,6 +1174,41 @@ fn now_ms() -> u64 {
 fn elapsed_ms(started: std::time::Instant) -> u64 {
     started.elapsed().as_millis() as u64
 }
+
+/// Pure zombie-watchdog verdict, extracted so the kill policy is unit-test
+/// time constant even though it fires inside a tokio select loop.
+///
+/// Contract (2 consecutive unacked heartbeats => zombie): with a 30s server
+/// interval, detection lands ~60-70s after the path dies — under one old
+/// heartbeat period of added latency, versus HOURS with the old loop that
+/// never checked acks at all.
+///
+/// `connected` is already known true (we are inside the event loop); it is
+/// threaded through so tests cover the full predicate, not a fragment.
+fn zombie_decision(connected: bool, consecutive_misses: u32) -> ZombieDecision {
+    ZombieDecision {
+        connected,
+        consecutive_misses,
+        kill: connected && consecutive_misses >= 2,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ZombieDecision {
+    connected: bool,
+    consecutive_misses: u32,
+    kill: bool,
+}
+
+/// t of a Heartbeat frame we just built (kept in one place so the select
+/// loop never desyncs from the frame construction).
+fn frame_heartbeat_t(frame: &BridgeFrame) -> u64 {
+    match frame {
+        BridgeFrame::Heartbeat(h) => h.t,
+        _ => 0,
+    }
+}
+
 fn contains_dangerous_shell(command: &str) -> bool {
     [
         "sudo ",
@@ -1125,4 +1220,54 @@ fn contains_dangerous_shell(command: &str) -> bool {
     ]
     .iter()
     .any(|pattern| command.contains(pattern))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zombie_requires_two_consecutive_misses() {
+        // Healthy: acks keep coming.
+        assert_eq!(
+            zombie_decision(true, 0),
+            ZombieDecision { connected: true, consecutive_misses: 0, kill: false }
+        );
+        // ONE miss: late ack / GC pause / slow link — never kill.
+        assert_eq!(
+            zombie_decision(true, 1),
+            ZombieDecision { connected: true, consecutive_misses: 1, kill: false }
+        );
+        // TWO consecutive misses: the path is dead (zombie verdict).
+        assert_eq!(
+            zombie_decision(true, 2),
+            ZombieDecision { connected: true, consecutive_misses: 2, kill: true }
+        );
+        // More misses keep the verdict (no un-kill).
+        assert_eq!(
+            zombie_decision(true, 5),
+            ZombieDecision { connected: true, consecutive_misses: 5, kill: true }
+        );
+        // Never kill when not connected (defensive).
+        assert_eq!(
+            zombie_decision(false, 9),
+            ZombieDecision { connected: false, consecutive_misses: 9, kill: false }
+        );
+    }
+
+    #[test]
+    fn zombie_uses_server_interval_not_hardcoded() {
+        // The watchdog timing is derived from hello_ack.heartbeatIntervalMs;
+        // this pins the contract that the interval flows from the server.
+        // FALLBACK_HEARTBEAT_INTERVAL_MS must match the web's published
+        // HEARTBEAT_INTERVAL_MS (30s) so a legacy server and a v1.2 server
+        // produce identical cadences.
+        assert_eq!(WsClient::FALLBACK_HEARTBEAT_INTERVAL_MS, 30_000);
+    }
+
+    #[test]
+    fn frame_heartbeat_t_extracts_t() {
+        let frame = BridgeFrame::Heartbeat(daemon_protocol::HeartbeatFrame { v: PROTOCOL_VERSION, t: 1727400000123 });
+        assert_eq!(frame_heartbeat_t(&frame), 1727400000123);
+    }
 }

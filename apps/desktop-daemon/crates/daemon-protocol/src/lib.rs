@@ -96,6 +96,10 @@ pub struct HelloAckFrame {
     pub v: u32,
     pub device_id: String,
     pub scopes: Scopes,
+    /// Server's own heartbeat cadence (protocol v1.2). Older servers omit
+    /// it; the daemon then falls back to the cadence those servers use
+    /// anyway, so one field serves both without a version bump in kind.
+    #[serde(default)]
     pub heartbeat_interval_ms: u64,
 }
 
