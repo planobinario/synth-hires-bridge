@@ -102,20 +102,31 @@ impl<'a> PairingFlow<'a> {
     }
 }
 
-/// Builds the WebSocket endpoint the WS client dials: if the server already
-/// returned an absolute ws:// / wss:// URL, use it verbatim; otherwise join
-/// the (possibly http/https) origin with the path, converting the scheme.
-///
-/// Shared with the CLI so the STARTUP path (state.backend_url persisted as a
-/// plain origin) normalizes the same way — feeding `http://` straight into
-/// tungstenite fails with "URL scheme not supported" and a restarted daemon
-/// could never reconnect (found by the paired-daemon E2E).
+/// Builds the WebSocket endpoint the WS client dials. Idempotent: the saved
+/// state may hold a plain origin (deep-link flow), a full http(s) URL that
+/// already contains the path, or an already-normalized ws(s) endpoint from
+/// a previous run — each must land on exactly one path suffix, never a
+/// doubled `/api/devices/ws/api/devices/ws` (that 404 was caught live by
+/// the paired-daemon E2E the moment the first normalized state re-ran
+/// through this function).
 pub fn ws_endpoint_for_origin(backend_origin: &str, ws_path: &str) -> String {
+    // Server already returned a full ws:// / wss:// URL: use it verbatim.
     if ws_path.starts_with("ws://") || ws_path.starts_with("wss://") {
         return ws_path.to_string();
     }
-    let origin = backend_origin
-        .trim_end_matches('/')
+    // State already holds a normalized ws endpoint (previous run): verbatim,
+    // never a doubled path.
+    if backend_origin.starts_with("ws://") || backend_origin.starts_with("wss://") {
+        return backend_origin.to_string();
+    }
+    let trimmed = backend_origin.trim_end_matches('/');
+    // http(s) URL that already ends with the ws path: convert scheme only.
+    if trimmed.ends_with(ws_path) {
+        return trimmed
+            .replace("https://", "wss://")
+            .replace("http://", "ws://");
+    }
+    let origin = trimmed
         .replace("https://", "wss://")
         .replace("http://", "ws://");
     format!("{origin}{}", ws_path)
@@ -150,6 +161,31 @@ mod tests {
         assert_eq!(
             ws_endpoint_for_origin("http://ignored", "wss://a/b"),
             "wss://a/b"
+        );    }
+
+    #[test]
+    fn ws_endpoint_is_idempotent_over_saved_states() {
+        // Plain origin (deep-link state): appends the path.
+        assert_eq!(
+            ws_endpoint_for_origin("http://127.0.0.1:8799", "/api/devices/ws"),
+            "ws://127.0.0.1:8799/api/devices/ws"
+        );
+        // Already-normalized ws endpoint (a previous run's state): verbatim,
+        // never a doubled path.
+        assert_eq!(
+            ws_endpoint_for_origin("ws://127.0.0.1:8799/api/devices/ws", "/api/devices/ws"),
+            "ws://127.0.0.1:8799/api/devices/ws"
+        );
+        // Full http URL that already carries the path: scheme-only convert.
+        assert_eq!(
+            ws_endpoint_for_origin("http://127.0.0.1:8799/api/devices/ws", "/api/devices/ws"),
+            "ws://127.0.0.1:8799/api/devices/ws"
+        );
+        // Running the output back through the function is a no-op.
+        let once = ws_endpoint_for_origin("http://host", "/api/devices/ws");
+        assert_eq!(
+            ws_endpoint_for_origin(&once, "/api/devices/ws"),
+            once
         );
     }
 }
