@@ -14,6 +14,7 @@
 #   DEEPSEEK_API_KEY=sk-... bash ... full-pipeline.sh --agent     # + real-model agent
 #   WATCHDOG=1 bash ... full-pipeline.sh                          # + zombie injection (~90s)
 set -uo pipefail
+PIDS=()
 
 E2E_ROOT="${E2E_ROOT:-/tmp/sh-e2e-$$}"
 WEB_REPO="${WEB_REPO:-$HOME/Proyectos/Webs/synth-hires}"
@@ -45,6 +46,9 @@ cleanup() {
   [[ "$KEEP" == "1" ]] && { log "KEEP=1: infra viva. worker=$WORKER_PORT pg=$PG_PORT root=$E2E_ROOT"; return 0; }
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
   wait 2>/dev/null
+  # wrangler corre detached (setsid): matar por puerto si sigue vivo
+  local WP=$(ss -tlnp 2>/dev/null | grep ":$WORKER_PORT" | grep -oP 'pid=\K[0-9]+' | head -1)
+  [[ -n "$WP" ]] && kill -9 "$WP" 2>/dev/null
   PGDATA="$E2E_ROOT/pgdata" "$PGCTL" -D "$E2E_ROOT/pgdata" stop -m fast -w -t 15 >/dev/null 2>&1
   log "infra parada"
 }
@@ -56,7 +60,6 @@ initdb -U postgres -A trust "$E2E_ROOT/pgdata" >/dev/null 2>&1
 PGCTL="$(command -v pg_ctl)"
 "$PGCTL" -D "$E2E_ROOT/pgdata" -l "$E2E_ROOT/pg.log" \
   -o "-p $PG_PORT -k $E2E_ROOT -c listen_addresses=127.0.0.1" start -w -t 30 >/dev/null
-PIDS+=($!)
 psql -h 127.0.0.1 -p "$PG_PORT" -U postgres -c "CREATE DATABASE synthhires" >/dev/null
 
 # Migraciones drizzle (ordenadas)
@@ -64,7 +67,8 @@ log "migraciones drizzle"
 cat "$WEB_REPO"/drizzle/*.sql | psql -h 127.0.0.1 -p "$PG_PORT" -U postgres -d synthhires -q \
   || { bad "migraciones"; exit 3; }
 
-DATABASE_URL="postgresql://postgres@127.0.0.1:$PG_PORT/synthhires"
+# miniflare exige user:password@ en la connection string del hyperdrive
+DATABASE_URL="postgresql://postgres:local@127.0.0.1:$PG_PORT/synthhires"
 
 # ─── 2. Worker real (build astro + wrangler dev) ─────────────────────────────
 log "build web (astro)"
@@ -73,13 +77,15 @@ log "build web (astro)"
 log "sirviendo worker en :$WORKER_PORT"
 WDIR="$E2E_ROOT/server"
 rsync -a --delete "$WEB_REPO/dist/server/" "$WDIR/"
+# wrangler.json referencia los assets estáticos como ../client
+rsync -a --delete "$WEB_REPO/dist/client/" "$E2E_ROOT/client/"
 python3 - "$WDIR/wrangler.json" "$PG_PORT" <<'EOF'
 import json, sys
 p, pgport = sys.argv[1], sys.argv[2]
 cfg = json.load(open(p))
 for hd in cfg.get('hyperdrive', []):
     if hd.get('binding') == 'HYPERDRIVE':
-        hd['localConnectionString'] = f'postgresql://postgres@127.0.0.1:{pgport}/synthhires'
+        hd['localConnectionString'] = f'postgresql://postgres:local@127.0.0.1:{pgport}/synthhires'
 json.dump(cfg, open(p, 'w'), indent=2)
 EOF
 cat > "$WDIR/.dev.vars" <<EOF
@@ -95,13 +101,24 @@ GUEST_AI_PER_IP_DAY=1000
 GUEST_AI_GLOBAL_DAY=10000
 EOF
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt   # NixOS: CA store para workerd
-(cd "$WDIR" && npx wrangler dev --port "$WORKER_PORT" --local >/dev/null 2>&1) &
+# Puerto libre (una run abortada deja el worker huérfano en el puerto)
+if ss -tln 2>/dev/null | grep -q ":$WORKER_PORT"; then
+  OLD=$(ss -tlnp 2>/dev/null | grep ":$WORKER_PORT" | grep -oP 'pid=\K[0-9]+' | head -1)
+  [[ -n "$OLD" ]] && kill -9 "$OLD" 2>/dev/null
+  ONODE=$(ps -o ppid= -p "$OLD" 2>/dev/null | tr -d ' '); [[ -n "$ONODE" ]] && kill -9 "$ONODE" 2>/dev/null
+  sleep 2
+fi
+(
+  cd "$WDIR"
+  setsid npx --yes wrangler dev --port "$WORKER_PORT" --ip 127.0.0.1 --local \
+    > "$E2E_ROOT/worker.log" 2>&1 < /dev/null
+) &
 WPID=$!; PIDS+=($WPID)
 
-for i in $(seq 1 40); do
+for i in $(seq 1 60); do
   curl -s -o /dev/null -m 2 "http://127.0.0.1:$WORKER_PORT/" && break; sleep 1
 done
-curl -s -o /dev/null -m 3 "http://127.0.0.1:$WORKER_PORT/" || { bad "worker no arrancó"; exit 3; }
+curl -s -o /dev/null -m 3 "http://127.0.0.1:$WORKER_PORT/" || { tail -20 "$E2E_ROOT/worker.log"; bad "worker no arrancó (ver $E2E_ROOT/worker.log)"; exit 3; }
 
 BASE="http://127.0.0.1:$WORKER_PORT"
 
@@ -158,6 +175,20 @@ log "emparejando daemon (pairing code desktop)"
   || { bad "daemon pair (ver $E2E_ROOT/paird.log)"; exit 4; }
 
 DEV_ID=$(python3 -c "import json;print(json.load(open('$E2E_ROOT/config/state.json'))['device_id'])")
+
+# Grant de scopes + alwaysAllowPaths ANTES de arrancar `run`: el flujo real del
+# producto es grant (UI/adjuntar workspace) → connect, y el DO entrega los
+# scopes en el hello_ack (scope_pending). Esto elimina la carrera del push
+# scope_update en vivo durante el arranque.
+log "grant de scopes y paths (antes de conectar: flujo real)"
+mkdir -p "$E2E_ROOT/work"
+CAPS='["desktop.fs.read","desktop.fs.write","desktop.fs.delete","desktop.fs.verify","desktop.fs.list","desktop.fs.patch","desktop.shell.execute","desktop.process.list","desktop.process.kill","desktop.network.fetch","desktop.tools.manifest","desktop.mcp.op","desktop.browser.launch","desktop.browser.nav","desktop.browser.snapshot","desktop.browser.act","desktop.browser.shot","desktop.browser.wait","desktop.browser.eval","desktop.browser.close","desktop.browser.tab_open","desktop.browser.tab_select","desktop.browser.tab_close","desktop.browser.tab_list","desktop.browser.mock_set","desktop.code.ast_grep","desktop.code.ast_edit","desktop.code.eval"]'
+HTTP=$(curl -s -o /dev/null -w '%{http_code}' -m 15 -X PATCH "$BASE/api/devices/$DEV_ID/scope" \
+  -H "Origin: $BASE" -H 'Content-Type: application/json' -b "$E2E_ROOT/owner.jar" \
+  -d "{\"capabilities\":$CAPS,\"alwaysAllowPaths\":[\"$E2E_ROOT/work\"],\"reason\":\"e2e-matrix\"}")
+[[ "$HTTP" == "200" ]] || { bad "grant de scopes (HTTP $HTTP)"; exit 4; }
+ok "scopes concedidos"
+
 # El daemon debe estar corriendo para las scenarios: `run` en background
 "$DAEMON_BIN" --headless --config-dir "$E2E_ROOT/config" run > "$E2E_ROOT/daemon.log" 2>&1 &
 DPID=$!; PIDS+=($DPID)
@@ -171,11 +202,16 @@ ok "pairing + WS online"
 # ─── 5. Scenarios ────────────────────────────────────────────────────────────
 WORK="$E2E_ROOT/work"; mkdir -p "$WORK/src"
 
-# S1: fs roundtrip
+# S1: fs roundtrip (fs.read devuelve content_base64)
 R=$(ACTION desktop.fs.write "{\"path\":\"$WORK/hello.txt\",\"content\":\"e2e-hello\"}")
 [[ "$(echo "$R" | JGET data.status)" == "completed" ]] && ok "S1 fs.write" || bad "S1 fs.write: $R"
 R=$(ACTION desktop.fs.read "{\"path\":\"$WORK/hello.txt\"}")
-echo "$R" | grep -q "e2e-hello" && ok "S1 fs.read roundtrip" || bad "S1 fs.read: $R"
+echo "$R" | python3 -c "
+import json,sys,base64
+d=json.load(sys.stdin)
+c=d['data']['result']['output']['content_base64']
+assert base64.b64decode(c).decode()=='e2e-hello', c
+" 2>/dev/null && ok "S1 fs.read roundtrip (base64 verificado)" || bad "S1 fs.read: $R"
 
 # S2: browser + route mocks
 R=$(ACTION desktop.browser.launch "{\"url\":\"http://127.0.0.1:$FIXTURE_PORT/fixture\",\"headed\":false}")
@@ -183,7 +219,14 @@ echo "$R" | grep -q "FIXTURE-OK" && ok "S2 browser.launch snapshot" || bad "S2 l
 R=$(ACTION desktop.browser.mock_set '{"rules":[{"urlContains":"/mock-e2e","status":200,"body":"{\"mocked\":true}","contentType":"application/json"}]}')
 echo "$R" | grep -q '"ok":true' && ok "S2 mock_set" || bad "S2 mock_set: $R"
 R=$(ACTION desktop.browser.nav "{\"url\":\"http://127.0.0.1:$FIXTURE_PORT/mock-e2e?cb=$RANDOM\"}")
-echo "$R" | grep -q '"mocked":true' && ok "S2 mock sirve en nav" || bad "S2 nav mock: $R"
+echo "$R" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+text=d['data']['result']['output']['snapshot']['text']
+net=d['data']['result']['output']['snapshot']['network']
+assert 'mocked' in text, text[:200]
+assert any(n.get('url','').startswith('http://127.0.0.1:$FIXTURE_PORT/mock-e2e') and n.get('status')==200 for n in net), net
+" 2>/dev/null && ok "S2 mock sirve en nav (200 mockeado en red + texto en DOM)" || bad "S2 nav mock: $R"
 echo "$R" | grep -q '"favicon' && ok "S2 passthrough red intacto (favicon 404 visible)" || ok "S2 passthrough (sin favicon check)"
 ACTION desktop.browser.close '{}' >/dev/null
 
@@ -212,9 +255,10 @@ echo "$R" | grep -q "ShellOK" && ok "S4 shell stdout" || bad "S4 shell ok: $R"
 R=$(ACTION desktop.shell.execute "{\"command\":\"exit 7\"}")
 echo "$R" | grep -q '"exit_code":7' && ok "S4 shell exit_code honesto (7)" || bad "S4 shell fail: $R"
 
-# S5: scope enforcement (capability fuera del default = rechazo)
+# S5: scope enforcement (capability fuera del grant = rechazo; el route
+# web la corta con capability_not_granted antes de llegar al daemon)
 R=$(ACTION desktop.debug.op '{"op":"sessions"}')
-echo "$R" | grep -q "capability not granted" && ok "S5 scope: capability no concedida rechazada" || bad "S5 scope: $R"
+echo "$R" | grep -q 'capability_not_granted' && ok "S5 scope: capability no concedida rechazada" || bad "S5 scope: $R"
 
 # S6: watchdog zombi (opcional)
 if [[ "$WATCHDOG" == "1" ]]; then
@@ -226,9 +270,7 @@ if [[ "$WATCHDOG" == "1" ]]; then
 fi
 
 # S7: agente real (opcional, path de producción /api/chat)
-if [[ "$AGENT" == "1" ]]; then
-  [[ -n "${DEEPSEEK_API_KEY:-}" ]] || { log "S7 sin DEEPSEEK_API_KEY: skip"; }
-  else
+if [[ "$AGENT" == "1" && -n "${DEEPSEEK_API_KEY:-}" ]]; then
   log "S7: agente real vía /api/chat (deepseek-v4-flash, effort low)"
   cat > "$E2E_ROOT/agent.json" <<EOF
 {"provider":"deepseek","model":"deepseek-v4-flash","apiKey":"$DEEPSEEK_API_KEY",
@@ -239,7 +281,9 @@ EOF
   curl -s -N -m 240 -X POST "$BASE/api/chat" -H "Origin: $BASE" -H 'Content-Type: application/json' \
     -b "$E2E_ROOT/owner.jar" --data-binary @"$E2E_ROOT/agent.json" > "$E2E_ROOT/agent.sse" 2>&1
   grep -q '"type":"error"' "$E2E_ROOT/agent.sse" && bad "S7 agente: error en stream" || ok "S7 agente: sin errores de stream"
-  [[ "$(cat "$WORK/agente.txt" 2>/dev/null)" == "agent-ok" ]] && ok "S7 agente: fichero creado por el modelo" || bad "S7 agente: fichero no creado"
+  [[ "$(cat "$E2E_ROOT/work/agente.txt" 2>/dev/null)" == "agent-ok" ]] && ok "S7 agente: fichero creado por el modelo" || bad "S7 agente: fichero no creado"
+else
+  [[ "$AGENT" == "1" ]] && log "S7 skip: sin DEEPSEEK_API_KEY"
 fi
 
 # ─── Resumen ────────────────────────────────────────────────────────────────
