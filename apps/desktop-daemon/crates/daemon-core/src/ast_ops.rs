@@ -454,8 +454,10 @@ mod tests {
         assert_eq!(res.matches.len(), 2, "{:?}", res.matches);
         assert!(res.matches.iter().all(|m| m.file.is_some()), "file labels required in dir mode");
         let files: Vec<&str> = res.matches.iter().map(|m| m.file.as_deref().unwrap()).collect();
-        assert!(files.iter().any(|f| f.ends_with("src/a.rs")), "{:?}", files);
-        assert!(files.iter().any(|f| f.ends_with("src/b.rs")), "{:?}", files);
+        // Filename-suffix assertions (not full relative paths): Windows
+        // runners use backslash separators.
+        assert!(files.iter().any(|f| f.ends_with("a.rs")), "{:?}", files);
+        assert!(files.iter().any(|f| f.ends_with("b.rs")), "{:?}", files);
         assert!(!files.iter().any(|f| f.contains("node_modules")), "skipped dir must not be walked: {:?}", files);
         assert_eq!(res.language, "rust");
         // Directory with no source files (inside the granted root):
