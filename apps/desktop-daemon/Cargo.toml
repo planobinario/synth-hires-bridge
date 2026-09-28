@@ -83,3 +83,11 @@ panic = "abort"
 [profile.dev]
 opt-level = 0
 debug = 1
+
+# CI-only test profile: no debuginfo → the linker's RAM peak drops hard
+# (ubuntu runners were dying to what looks like systemd-oomd reaping the
+# job cgroup during the debug link of the test binaries). Local dev keeps
+# `debug = 1` for backtraces.
+[profile.ci]
+inherits = "dev"
+debug = false

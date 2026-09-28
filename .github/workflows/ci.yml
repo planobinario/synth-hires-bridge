@@ -41,15 +41,15 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libglib2.0-dev libgtk-3-dev libdbus-1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libayatana-appindicator3-dev libxdo-dev
       - name: cargo check
         run: cargo check --bin synthhires-bridge
-      # Test parallelism capped: ubuntu jobs have died to "runner shutdown
-      # signal" 6 times in a row ~5min into cargo test across two images
-      # (windows/macos pass the same commits) — consistent with
-      # systemd-oomd killing the job cgroup on memory pressure. Gather the
-      # kernel's verdict on failure instead of guessing.
+      # CI debugging profile: `-C debuginfo=0` slashes the link-time RAM
+      # peak of the test binaries. Ubuntu deaths (6 in a row, always during
+      # the compile/link phase of `cargo test`, never in the tests) match
+      # systemd-oomd reaping the job cgroup at the linker memory spike.
+      # Test threads capped at 2 to level the same pressure.
       - name: cargo test
-        run: cargo test -- --test-threads=2
-      - name: Debug runner death (on failure)
-        if: failure() && runner.os == 'Linux'
+        run: cargo test --profile ci -- --test-threads=2
+      - name: Debug runner death (on failure or cancel)
+        if: ${{ !success() && runner.os == 'Linux' }}
         run: |
           echo '== dmesg tail (oom/kill evidence) =='
           sudo dmesg | tail -60 || true
