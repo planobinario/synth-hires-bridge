@@ -716,10 +716,22 @@ async fn live_browser_route_mock_serves_locally_and_passes_through() {
         return { ok, boomStatus, realStatus: realR.status, realIsHtml: realText.includes('<html') };
     })()"#;
 
-    let waited = store
-        .wait(WaitParams { timeout_ms: Some(8_000), text: None, sleep_ms: Some(1_200) })
-        .await
-        .expect("wait for fetches");
+    // The wait is a readiness aid — the REAL assertions live in the eval
+    // probe below. CDP's ax-tree request times out transiently under CI
+    // load (observed once on a macos runner: "ax tree: Request timed
+    // out."), so retry once before giving up; a genuine breakage still
+    // fails with the ORIGINAL error in the panic message.
+    let wait_params = || WaitParams { timeout_ms: Some(8_000), text: None, sleep_ms: Some(1_200) };
+    let waited = match store.wait(wait_params()).await {
+        Ok(w) => w,
+        Err(first) => {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            store
+                .wait(wait_params())
+                .await
+                .unwrap_or_else(|second| panic!("wait for fetches (retried): first={first} second={second}"))
+        }
+    };
     let _ = waited;
     let result = store
         .eval(BrowserEvalParams { expression: probe.into() })
