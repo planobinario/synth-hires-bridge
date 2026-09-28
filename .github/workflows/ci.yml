@@ -42,12 +42,19 @@ jobs:
       - name: cargo check
         run: cargo check --bin synthhires-bridge
       # CI debugging profile: `-C debuginfo=0` slashes the link-time RAM
-      # peak of the test binaries. Ubuntu deaths (6 in a row, always during
-      # the compile/link phase of `cargo test`, never in the tests) match
+      # peak of the test binaries. Ubuntu deaths (7 in a row, always during
+      # the compile/link phase of `cargo test`, never inside a test) match
       # systemd-oomd reaping the job cgroup at the linker memory spike.
       # Test threads capped at 2 to level the same pressure.
-      - name: cargo test
-        run: cargo test --profile ci -- --test-threads=2
+      # Ubuntu isolates the variable by testing ONLY the lib (no link of the
+      # big daemon-cli binary — the nix-build job already validates that
+      # build on Linux, and windows/macos run the full suite).
+      - name: cargo test (lib only, ubuntu)
+        if: runner.os == 'Linux'
+        run: cargo test --lib --profile ci -- --test-threads=2
+      - name: cargo test (full, non-linux)
+        if: runner.os != 'Linux'
+        run: cargo test --profile ci
       - name: Debug runner death (on failure or cancel)
         if: ${{ !success() && runner.os == 'Linux' }}
         run: |
