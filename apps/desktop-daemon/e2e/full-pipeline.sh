@@ -182,7 +182,7 @@ DEV_ID=$(python3 -c "import json;print(json.load(open('$E2E_ROOT/config/state.js
 # scope_update en vivo durante el arranque.
 log "grant de scopes y paths (antes de conectar: flujo real)"
 mkdir -p "$E2E_ROOT/work"
-CAPS='["desktop.fs.read","desktop.fs.write","desktop.fs.delete","desktop.fs.verify","desktop.fs.list","desktop.fs.patch","desktop.shell.execute","desktop.process.list","desktop.process.kill","desktop.network.fetch","desktop.tools.manifest","desktop.mcp.op","desktop.browser.launch","desktop.browser.nav","desktop.browser.snapshot","desktop.browser.act","desktop.browser.shot","desktop.browser.wait","desktop.browser.eval","desktop.browser.close","desktop.browser.tab_open","desktop.browser.tab_select","desktop.browser.tab_close","desktop.browser.tab_list","desktop.browser.mock_set","desktop.code.ast_grep","desktop.code.ast_edit","desktop.code.eval"]'
+CAPS='["desktop.fs.read","desktop.fs.write","desktop.fs.delete","desktop.fs.verify","desktop.fs.list","desktop.fs.patch","desktop.shell.execute","desktop.process.list","desktop.process.kill","desktop.network.fetch","desktop.tools.manifest","desktop.mcp.op","desktop.browser.launch","desktop.browser.nav","desktop.browser.snapshot","desktop.browser.act","desktop.browser.shot","desktop.browser.wait","desktop.browser.eval","desktop.browser.close","desktop.browser.tab_open","desktop.browser.tab_select","desktop.browser.tab_close","desktop.browser.tab_list","desktop.browser.mock_set","desktop.code.ast_grep","desktop.code.ast_edit","desktop.code.eval","desktop.fs.restore"]'
 HTTP=$(curl -s -o /dev/null -w '%{http_code}' -m 15 -X PATCH "$BASE/api/devices/$DEV_ID/scope" \
   -H "Origin: $BASE" -H 'Content-Type: application/json' -b "$E2E_ROOT/owner.jar" \
   -d "{\"capabilities\":$CAPS,\"alwaysAllowPaths\":[\"$E2E_ROOT/work\"],\"reason\":\"e2e-matrix\"}")
@@ -284,6 +284,58 @@ EOF
   [[ "$(cat "$E2E_ROOT/work/agente.txt" 2>/dev/null)" == "agent-ok" ]] && ok "S7 agente: fichero creado por el modelo" || bad "S7 agente: fichero no creado"
 else
   [[ "$AGENT" == "1" ]] && log "S7 skip: sin DEEPSEEK_API_KEY"
+fi
+
+# S8: undo/checkpoint (spec: docs/undo-checkpoint-spec.md)
+# write -> pre-imagen checkpointed -> write destructivo -> restore -> byte a byte.
+R=$(ACTION desktop.fs.write "{\"path\":\"$WORK/undo.txt\",\"content\":\"ORIGINAL-UNDOSH\"}")
+echo "$R" | grep -q '"verified":true' && ok "S8 fs.write original" || bad "S8 write original: $R"
+R=$(ACTION desktop.fs.write "{\"path\":\"$WORK/undo.txt\",\"content\":\"AGENT-DESTROYED-CONTENT\"}")
+echo "$R" | grep -q '"verified":true' && ok "S8 fs.write destructivo" || bad "S8 write destructivo: $R"
+# El indice vive en el config-dir del daemon E2E ($E2E_ROOT/config/checkpoints).
+# El checkpoint existed=True mas reciente de ese path contiene la pre-imagen
+# ORIGINAL: el capture corre ANTES de cada write, y el ultimo write fue el
+# destructivo (su pre-imagen es el contenido original).
+TS=$(python3 - <<PYEOF
+import json
+entries=[]
+try:
+    for line in open("$E2E_ROOT/config/checkpoints/index.jsonl"):
+        e=json.loads(line)
+        if e.get("path")=="$WORK/undo.txt" and e.get("existed") and not e.get("truncated"):
+            entries.append(e)
+except FileNotFoundError:
+    pass
+print(entries[-1]["ts"] if entries else "")
+PYEOF
+)
+if [[ -n "$TS" ]]; then
+  R=$(ACTION desktop.fs.restore "{\"ts\":$TS}")
+  echo "$R" | grep -q '"restored":true' && ok "S8 restore ejecutado" || bad "S8 restore: $R"
+  [[ "$(cat "$WORK/undo.txt" 2>/dev/null)" == "ORIGINAL-UNDOSH" ]] && ok "S8 restauracion byte a byte verificada" || bad "S8 contenido tras restore: $(cat "$WORK/undo.txt" 2>/dev/null)"
+  # Undo de creacion: fichero que NO existia antes del write del agente.
+  ACTION desktop.fs.write "{\"path\":\"$WORK/creado.txt\",\"content\":\"efimero\"}" >/dev/null
+  TS2=$(python3 - <<PYEOF
+import json
+entries=[]
+try:
+    for line in open("$E2E_ROOT/config/checkpoints/index.jsonl"):
+        e=json.loads(line)
+        if e.get("path")=="$WORK/creado.txt" and not e.get("existed"):
+            entries.append(e)
+except FileNotFoundError:
+    pass
+print(entries[-1]["ts"] if entries else "")
+PYEOF
+)
+  if [[ -n "$TS2" ]]; then
+    ACTION desktop.fs.restore "{\"ts\":$TS2}" >/dev/null
+    [[ ! -e "$WORK/creado.txt" ]] && ok "S8 undo de creacion = borrado" || bad "S8 creado.txt sigue existiendo"
+  else
+    bad "S8: no se encontro checkpoint de creacion"
+  fi
+else
+  bad "S8: checkpoint de pre-imagen no encontrado en indice (capture no cableado?)"
 fi
 
 # ─── Resumen ────────────────────────────────────────────────────────────────

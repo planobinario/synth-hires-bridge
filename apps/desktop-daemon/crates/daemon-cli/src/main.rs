@@ -233,6 +233,14 @@ fn main() -> Result<()> {
 
     let config_dir = config_dir_of(&cli);
     std::fs::create_dir_all(&config_dir).ok();
+    // Undo/checkpoint store follows --config-dir (spec: local-only store).
+    // An explicit SYNTHHIRES_CHECKPOINTS (incl. `off`) always wins.
+    if std::env::var_os("SYNTHHIRES_CHECKPOINTS").is_none() {
+        std::env::set_var(
+            "SYNTHHIRES_CHECKPOINTS",
+            config_dir.join("checkpoints").display().to_string(),
+        );
+    }
 
     let (log_tx, log_rx) = std::sync::mpsc::sync_channel(2000);
     let ui_logger = UiLogger { tx: log_tx };
@@ -374,6 +382,14 @@ fn main() -> Result<()> {
         "synthhires-bridge",
         native_options,
         Box::new(move |cc| {
+            let checkpoint_store = std::env::var("SYNTHHIRES_CHECKPOINTS")
+                .ok()
+                .filter(|v| v != "off")
+                .and_then(|dir| {
+                    daemon_core::CheckpointStore::open(std::path::Path::new(&dir))
+                        .map(std::sync::Arc::new)
+                        .ok()
+                });
             let app = ui::BridgeApp::new(
                 cc,
                 status_rx,
@@ -384,7 +400,8 @@ fn main() -> Result<()> {
                 chat_store.clone(),
                 consent_broker_ui,
                 ws_health.clone(),
-            );
+            )
+            .with_checkpoints(checkpoint_store);
             let mut w_ctx = ui_ctx.blocking_write();
             *w_ctx = Some(cc.egui_ctx.clone());
             Ok(Box::new(app))

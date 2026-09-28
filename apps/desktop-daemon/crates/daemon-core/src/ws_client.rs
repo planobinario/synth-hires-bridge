@@ -95,6 +95,8 @@ pub struct WsClient {
     chat_store: Arc<ChatStore>,
     consent: Arc<ConsentBroker>,
     health: Arc<WsHealth>,
+    /// Pre-image store for undo. None in tests/android; Some in production.
+    checkpoints: Option<Arc<crate::checkpoint::CheckpointStore>>,
 }
 
 impl WsClient {
@@ -111,6 +113,10 @@ impl WsClient {
         consent: Arc<ConsentBroker>,
         health: Arc<WsHealth>,
     ) -> Self {
+        // Undo/checkpoint store (docs/undo-checkpoint-spec.md): every fs
+        // mutation by the agent gets a recoverable pre-image. Tests and the
+        // Android JNI entry opt out via with_checkpoint_dir(None).
+        let checkpoints = Self::checkpoint_store_from_env();
         let gate = Arc::new(Mutex::new(gate));
         Self {
             backend_url: backend_url.into(),
@@ -140,6 +146,47 @@ impl WsClient {
             chat_store,
             consent,
             health,
+            checkpoints,
+        }
+    }
+
+    /// Production wiring: point the undo store at the daemon's config dir.
+    /// Returns Self for chaining right after `WsClient::new(...)`.
+    pub fn with_checkpoint_dir(self, dir: Option<std::path::PathBuf>) -> Self {
+        let checkpoints = dir.and_then(|d| {
+            match crate::checkpoint::CheckpointStore::open(&d) {
+                Ok(s) => Some(Arc::new(s)),
+                Err(e) => {
+                    tracing::warn!("checkpoint store unavailable ({e}); undo disabled");
+                    None
+                }
+            }
+        });
+        Self { checkpoints, ..self }
+    }
+
+    /// Env-aware default store location: SYNTHHIRES_CHECKPOINTS=<dir> pins
+    /// it, `off` disables, unset derives ProjectDirs(com/synthhires/bridge).
+    fn checkpoint_store_from_env() -> Option<Arc<crate::checkpoint::CheckpointStore>> {
+        match std::env::var("SYNTHHIRES_CHECKPOINTS") {
+            Ok(v) if v == "off" => None,
+            Ok(v) => Some(Self::open_store_or_fallback(std::path::PathBuf::from(v))),
+            Err(_) => directories::ProjectDirs::from("com", "synthhires", "bridge")
+                .map(|d| Self::open_store_or_fallback(d.config_dir().join("checkpoints"))),
+        }
+    }
+
+    fn open_store_or_fallback(dir: std::path::PathBuf) -> Arc<crate::checkpoint::CheckpointStore> {
+        match crate::checkpoint::CheckpointStore::open(&dir) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                tracing::warn!("checkpoint store unavailable at {} ({e}); temp-dir fallback", dir.display());
+                let fallback = std::env::temp_dir().join("synthhires-checkpoints");
+                Arc::new(
+                    crate::checkpoint::CheckpointStore::open(&fallback)
+                        .expect("writable temp dir is a platform invariant"),
+                )
+            }
         }
     }
 
@@ -422,9 +469,14 @@ impl WsClient {
                 }
                 _ => "desktop.fs.read",
             }
+            // The restore arm performs its OWN two-path authorization
+            // (explicit grant OR one-shot interactive consent — a server-side
+            // skip_consent_prompt flag must never widen what the user can
+            // undo on their own disk), so the generic pre-check is skipped.
+            "desktop.fs.restore" => "self",
             other => other,
         };
-        if !self.gate.lock().await.allows(required_scope) {
+        if required_scope != "self" && !self.gate.lock().await.allows(required_scope) {
             return self
                 .send_error(
                     ws,
@@ -474,19 +526,23 @@ impl WsClient {
                     serde_json::from_value::<crate::fs_ops::FsPatchRequest>(request.params.clone());
                 match parsed {
                     Ok(value) => match self.path_gate(&request, "desktop.fs.write", &value.path).await {
-                        Ok(gate) => match crate::fs_ops::FsOps::new(&gate).patch(value).await {
-                            Ok(result) => {
-                                self.send_action_result(
-                                    ws,
-                                    request.id,
-                                    result.verified,
-                                    Some(serde_json::to_value(&result)?),
-                                    (!result.verified).then_some("patch read-back verification failed".into()),
-                                    elapsed_ms(started),
-                                )
-                                .await
-                            }
-                            Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                        Ok(gate) => match self.checkpoint_before(&request, &value.path).await {
+                            Ok(()) => match crate::fs_ops::FsOps::new(&gate).patch(value).await {
+                                Ok(result) => {
+                                    self.send_action_result(
+                                        ws,
+                                        request.id,
+                                        result.verified,
+                                        Some(serde_json::to_value(&result)?),
+                                        (!result.verified)
+                                            .then_some("patch read-back verification failed".into()),
+                                        elapsed_ms(started),
+                                    )
+                                    .await
+                                }
+                                Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                            },
+                            Err(error) => self.send_error(ws, request.id, error).await,
                         },
                         Err(error) => self.send_error(ws, request.id, error.to_string()).await,
                     },
@@ -498,9 +554,12 @@ impl WsClient {
                     serde_json::from_value::<crate::fs_ops::FsWriteRequest>(request.params.clone());
                 match parsed {
                     Ok(value) => match self.path_gate(&request, "desktop.fs.write", &value.path).await {
-                        Ok(gate) => match crate::fs_ops::FsOps::new(&gate).write(value).await {
-                            Ok(result) => self.send_action_result(ws, request.id, result.verified, Some(serde_json::json!({"bytes_written": result.bytes_written, "verified": result.verified})), (!result.verified).then_some("write read-back verification failed".into()), elapsed_ms(started)).await,
-                            Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                        Ok(gate) => match self.checkpoint_before(&request, &value.path).await {
+                            Ok(()) => match crate::fs_ops::FsOps::new(&gate).write(value).await {
+                                Ok(result) => self.send_action_result(ws, request.id, result.verified, Some(serde_json::json!({"bytes_written": result.bytes_written, "verified": result.verified})), (!result.verified).then_some("write read-back verification failed".into()), elapsed_ms(started)).await,
+                                Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                            },
+                            Err(error) => self.send_error(ws, request.id, error).await,
                         },
                         Err(error) => self.send_error(ws, request.id, error.to_string()).await,
                     },
@@ -520,20 +579,23 @@ impl WsClient {
                 match parsed {
                     Ok(value) => {
                         let gate = self.gate.lock().await.clone();
-                        match crate::ast_ops::AstOps::new(&gate).edit(value).await {
-                            Ok(result) => {
-                                self.send_action_result(
-                                    ws,
-                                    request.id,
-                                    result.verified,
-                                    Some(serde_json::to_value(&result)?),
-                                    (!result.verified)
-                                        .then_some("ast_edit read-back verification failed".into()),
-                                    elapsed_ms(started),
-                                )
-                                .await
-                            }
-                            Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                        match self.checkpoint_before(&request, &value.path).await {
+                            Ok(()) => match crate::ast_ops::AstOps::new(&gate).edit(value).await {
+                                Ok(result) => {
+                                    self.send_action_result(
+                                        ws,
+                                        request.id,
+                                        result.verified,
+                                        Some(serde_json::to_value(&result)?),
+                                        (!result.verified)
+                                            .then_some("ast_edit read-back verification failed".into()),
+                                        elapsed_ms(started),
+                                    )
+                                    .await
+                                }
+                                Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                            },
+                            Err(error) => self.send_error(ws, request.id, error).await,
                         }
                     }
                     Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
@@ -777,19 +839,22 @@ impl WsClient {
                         .path_gate(&request, "desktop.fs.delete", &value.path)
                         .await
                     {
-                        Ok(gate) => match crate::fs_ops::FsOps::new(&gate).delete(value).await {
-                            Ok(()) => {
-                                self.send_action_result(
-                                    ws,
-                                    request.id,
-                                    true,
-                                    Some(serde_json::json!({"deleted": true})),
-                                    None,
-                                    elapsed_ms(started),
-                                )
-                                .await
-                            }
-                            Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                        Ok(gate) => match self.checkpoint_before(&request, &value.path).await {
+                            Ok(()) => match crate::fs_ops::FsOps::new(&gate).delete(value).await {
+                                Ok(()) => {
+                                    self.send_action_result(
+                                        ws,
+                                        request.id,
+                                        true,
+                                        Some(serde_json::json!({"deleted": true})),
+                                        None,
+                                        elapsed_ms(started),
+                                    )
+                                    .await
+                                }
+                                Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                            },
+                            Err(error) => self.send_error(ws, request.id, error).await,
                         },
                         Err(error) => self.send_error(ws, request.id, error.to_string()).await,
                     },
@@ -797,6 +862,93 @@ impl WsClient {
                         self.send_error(ws, request.id, format!("bad params: {error}"))
                             .await
                     }
+                }
+            }
+            "desktop.fs.restore" => {
+                // Undo: NO entry in any pairing preset. Two legitimate paths:
+                // (a) the owner granted desktop.fs.restore explicitly, or
+                // (b) a one-shot interactive consent — which skip_consent_prompt
+                // must NEVER substitute (a server-side flag cannot widen
+                // what the user can undo on their own disk).
+                let parsed = serde_json::from_value::<serde_json::Value>(request.params.clone());
+                match parsed {
+                    Ok(value) => {
+                        let ts = value.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
+                        if ts == 0 {
+                            return self
+                                .send_error(ws, request.id, "bad params: ts (ms) requerido".into())
+                                .await;
+                        } else if self.checkpoints.is_none() {
+                            return self
+                                .send_error(ws, request.id, "checkpoint store unavailable".into())
+                                .await;
+                        } else {
+                            let store = self.checkpoints.as_ref().unwrap();
+                            let entry = store.list().into_iter().find(|e| e.ts == ts);
+                            let Some(entry) = entry else {
+                                return self
+                                    .send_error(
+                                        ws,
+                                        request.id,
+                                        format!("checkpoint {ts} no existe (¿evicted?)"),
+                                    )
+                                    .await;
+                            };
+                            let granted = self.gate.lock().await.allows("desktop.fs.restore");
+                            let authorized = if granted {
+                                true
+                            } else if request.skip_consent_prompt {
+                                false
+                            } else {
+                                let rx = self.consent.ask(crate::consent::ConsentPrompt {
+                                    action_id: request.id.clone(),
+                                    capability: "desktop.fs.restore".into(),
+                                    summary: format!(
+                                        "Restaurar {} desde checkpoint",
+                                        entry.path
+                                    ),
+                                    path: Some(entry.path.clone()),
+                                });
+                                matches!(
+                                    tokio::time::timeout(std::time::Duration::from_secs(120), rx).await,
+                                    Ok(Ok(answer)) if answer.approved
+                                )
+                            };
+                            if !authorized {
+                                return self
+                                    .send_error(
+                                        ws,
+                                        request.id,
+                                        "capability_denied: desktop.fs.restore (concede el permiso o responde al diálogo)".into(),
+                                    )
+                                    .await;
+                            } else {
+                                match store.restore(ts) {
+                                    Ok(rollback) => {
+                                        self.send_action_result(
+                                            ws,
+                                            request.id,
+                                            true,
+                                            Some(serde_json::json!({
+                                                "restored": true,
+                                                "ts": ts,
+                                                "path": entry.path,
+                                                "rollback_ts": rollback.ts,
+                                            })),
+                                            None,
+                                            elapsed_ms(started),
+                                        )
+                                        .await
+                                    }
+                                    Err(e) => {
+                                        self.send_error(ws, request.id, format!("restore failed: {e}"))
+                                            .await
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
                 }
             }
             "desktop.fs.verify" => {
@@ -1022,6 +1174,36 @@ impl WsClient {
         });
     }
 
+    /// Capture the recoverable pre-image for a mutating fs action. Called
+    /// AFTER the gate authorizes and BEFORE the mutation runs — the pre-image
+    /// is the only copy of the user's data if the write goes wrong.
+    /// Contract (spec): a capture failure REFUSES the mutation — proceeding
+    /// without a safety net silently recreates the status quo. Truncated
+    /// captures (>32 MiB files, dirs) still record intent metadata.
+    async fn checkpoint_before(
+        &self,
+        request: &daemon_protocol::ActionRequestFrame,
+        path: &std::path::Path,
+    ) -> std::result::Result<(), String> {
+        if let Some(store) = self.checkpoints.as_ref() {
+            store
+                .capture(&request.id, &request.capability, path)
+                .map(|entry| {
+                    tracing::debug!(
+                        "checkpoint: {} {} existed={} size={} truncated={}",
+                        entry.capability,
+                        entry.path,
+                        entry.existed,
+                        entry.size,
+                        entry.truncated
+                    );
+                })
+                .map_err(|e| format!("checkpoint failed (mutation refused): {e}"))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Resolve the gate for a path-scoped action.
     ///
     /// Capability deny is final (scope-level, no dialog can widen it).
@@ -1188,7 +1370,8 @@ fn task_kind(capability: &str) -> TaskKind {
     match capability {
         "desktop.shell.execute" => TaskKind::ShellExec,
         "desktop.fs.read" => TaskKind::FileRead,
-        "desktop.fs.write" | "desktop.fs.delete" | "desktop.fs.patch" | "desktop.code.ast_edit" => {
+        "desktop.fs.write" | "desktop.fs.delete" | "desktop.fs.patch" | "desktop.code.ast_edit"
+        | "desktop.fs.restore" => {
             TaskKind::FileWrite
         }
         "desktop.code.ast_grep" => TaskKind::FileRead,

@@ -1,7 +1,16 @@
-# Undo / Checkpoint — Especificación (NO IMPLEMENTADO)
+# Undo / Checkpoint — Especificación
 
-Estado: **especificado, no implementado**. Este documento es el contrato de
-diseño; cualquier implementación debe cumplirlo completo o declarar la desviación.
+Estado: **IMPLEMENTADO (daemon-core 0.1.21)**. Desviación declarada: blobs SIN
+comprimir (spec original decía zstd) para no añadir dependencias — los límites
+duros acotan el almacén igualmente; comprimir es un cambio puramente local y
+retrocompatible con el índice. Implementación: `daemon-core/src/checkpoint.rs`,
+gancho en `WsClient::checkpoint_before` (invocado tras el gate y antes de
+mutar), capability `desktop.fs.restore` con doble vía (grant explícito o
+diálogo de consentimiento one-shot; `skip_consent_prompt` NUNCA lo autoriza),
+panel "Cambios del agente (deshacer)" en la pestaña Actividad del daemon UI.
+Store: `<config-dir>/checkpoints` (override `SYNTHHIRES_CHECKPOINTS=<dir>`,
+`off` desactiva). Escenario E2E de restauración byte a byte en
+`e2e/full-pipeline.sh` (S9).
 
 Motivación: hoy `fs_write`, `fs_patch` y `fs_delete` sobrescriben/borran sin
 pre-imagen recuperable. Un agente que se equivoca destruye trabajo del usuario

@@ -10,6 +10,7 @@
 
 pub mod ast_ops;
 pub mod audit;
+pub mod checkpoint;
 // Always compiled: real impl behind the `browser` feature, API-preserving stubs
 // without it (ws_client dispatches uniformly either way).
 pub mod browser_ops;
@@ -41,6 +42,7 @@ pub mod ws_client;
 pub use audit::AuditLog;
 pub use autoupdate::{check_for_update, download_and_verify, SignedManifest, UpdateStatus};
 pub use capability::{CapabilityGate, GateDecision};
+pub use checkpoint::{CheckpointEntry, CheckpointStore};
 pub use chat_store::ChatStore;
 pub use consent::{ConsentAnswer, ConsentBroker, ConsentPrompt};
 pub use fingerprint::DeviceFingerprint;
