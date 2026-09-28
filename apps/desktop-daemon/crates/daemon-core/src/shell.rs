@@ -598,7 +598,11 @@ mod tests {
         // The daemon must survive with a bounded buffer and report the
         // truncation honestly.
         let command = if cfg!(target_os = "windows") {
-            "powershell -Command \"for($i=0;$i -lt 900000;$i++){ Write-Output 0123456789 }\""
+            // One ~5 MB line, NOT a 900k-iteration loop: process spawn
+            // plus per-iteration interpreter overhead on CI Windows eats
+            // the whole 10s clamp and the test times out instead of
+            // proving truncation (observed in CI).
+            "powershell -Command \"Write-Output ('0123456789' * 500000)\""
         } else {
             "seq 1 1000000"
         };
