@@ -270,6 +270,7 @@ mod tests {
         let gate = CapabilityGate::new(ScopeSnapshot {
             capabilities: vec!["desktop.shell.execute".into()],
             always_allow_paths: Vec::new(),
+            one_shot_paths: vec![],
         });
         let cancellation = CancellationToken::new();
         let command = if cfg!(target_os = "windows") {

@@ -129,11 +129,6 @@ pub struct BridgeApp {
     conv_search: String,
     conv_error: Option<String>,
     consent: std::sync::Arc<ConsentBroker>,
-    // Undo surface (docs/undo-checkpoint-spec.md): every fs mutation of the
-    // agent is listed here with a one-click restore. None = store disabled.
-    checkpoints: Option<std::sync::Arc<daemon_core::CheckpointStore>>,
-    restore_confirm_ts: Option<u64>,
-    restore_notice: Option<String>,
     // Real WS connection state (connected/RTT/reconnects/last_error). The
     // status_rx string channel is NOT authoritative for connection state.
     ws_health: std::sync::Arc<daemon_core::WsHealth>,
@@ -172,20 +167,10 @@ impl BridgeApp {
             conv_search: String::new(),
             conv_error: None,
             consent,
-            checkpoints: None,
-            restore_confirm_ts: None,
-            restore_notice: None,
             ws_health,
         }
     }
 
-    pub fn with_checkpoints(
-        mut self,
-        store: Option<std::sync::Arc<daemon_core::CheckpointStore>>,
-    ) -> Self {
-        self.checkpoints = store;
-        self
-    }
 
     // ── data plumbing (unchanged behavior) ───────────────────────────────
 
@@ -1060,91 +1045,6 @@ impl BridgeApp {
     }
 
     fn activity_tab(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        // ── Undo/checkpoints panel ────────────────────────────────────────
-        if let Some(store) = &self.checkpoints {
-            ui.add_space(6.0);
-            if let Some(notice) = self.restore_notice.clone() {
-                card(ui, p, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(&notice).size(12.0).color(p.warning));
-                        if button(ui, &BtnStyle::ghost("✕", p)).clicked() {
-                            self.restore_notice = None;
-                        }
-                    });
-                });
-                ui.add_space(6.0);
-            }
-            card(ui, p, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Cambios del agente (deshacer)")
-                            .size(13.0)
-                            .strong()
-                            .color(p.text),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new("últimos 200 · restaurable")
-                                .size(10.5)
-                                .color(p.text_faint),
-                        );
-                    });
-                });
-                let entries = store.list();
-                if entries.is_empty() {
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "Todavía no hay cambios: cada escritura/borrado del agente\nquedará aquí con su estado anterior recuperable.",
-                        )
-                        .size(11.5)
-                        .color(p.text_faint),
-                    );
-                } else {
-                    egui::ScrollArea::vertical()
-                        .id_salt("ckpt-scroll")
-                        .max_height(160.0)
-                        .show(ui, |ui| {
-                            for e in entries.iter().take(50) {
-                                ui.horizontal(|ui| {
-                                    let when = chrono::DateTime::from_timestamp_millis(e.ts as i64)
-                                        .map(|d| d.with_timezone(&chrono::Local).format("%d/%m %H:%M:%S").to_string())
-                                        .unwrap_or_default();
-                                    ui.label(egui::RichText::new(when).size(10.5).color(p.text_faint).monospace());
-                                    ui.label(
-                                        egui::RichText::new(
-                                            e.capability.trim_start_matches("desktop.fs."),
-                                        )
-                                        .size(10.5)
-                                        .color(p.warning)
-                                        .monospace(),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new(
-                                            if e.path.chars().count() > 44 {
-                                                format!("…{}", e.path.chars().skip(e.path.chars().count() - 43).collect::<String>())
-                                            } else {
-                                                e.path.clone()
-                                            },
-                                        )
-                                        .size(10.5)
-                                        .monospace(),
-                                    );
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if !e.truncated
-                                            && button(ui, &BtnStyle::ghost("Deshacer", p)).clicked()
-                                        {
-                                            self.restore_confirm_ts = Some(e.ts);
-                                            self.restore_notice = None;
-                                        }
-                                    });
-                                });
-                            }
-                        });
-                }
-            });
-        }
         ui.add_space(6.0);
         let tasks = self.tasks_rx.borrow().clone();
         if tasks.is_empty() {
@@ -1636,52 +1536,6 @@ impl eframe::App for BridgeApp {
                 Tab::Logs => self.logs_tab(ui, &p),
             });
 
-        // Undo confirmation modal (restore is itself checkpointed, so this
-        // is always reversible — the confirm exists to prevent MISTAKES,
-        // not data loss).
-        if let Some(ts) = self.restore_confirm_ts {
-            show_modal(ctx, "restore-modal", 440.0, |ui, p| {
-                ui.horizontal(|ui| {
-                    status_dot(ui, p, p.warning, false);
-                    ui.label(
-                        egui::RichText::new("Restaurar checkpoint")
-                            .size(16.0)
-                            .strong()
-                            .color(p.text),
-                    );
-                });
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(
-                        "El estado ACTUAL del fichero se guardará antes de restaurar\n(podrás deshacer esta restauración).",
-                    )
-                    .size(12.0)
-                    .color(p.text_dim),
-                );
-                ui.add_space(10.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if button(ui, &BtnStyle::ghost("Cancelar", p)).clicked() {
-                        self.restore_confirm_ts = None;
-                    }
-                    if button(ui, &BtnStyle::danger("Restaurar", p)).clicked() {
-                        if let Some(store) = &self.checkpoints {
-                            match store.restore(ts) {
-                                Ok(rb) => {
-                                    self.restore_notice = Some(format!(
-                                        "Restaurado ✓ (rollback disponible: {})",
-                                        rb.ts
-                                    ));
-                                }
-                                Err(e) => {
-                                    self.restore_notice = Some(format!("Error: {e}"));
-                                }
-                            }
-                        }
-                        self.restore_confirm_ts = None;
-                    }
-                });
-            });
-        }
     }
 }
 

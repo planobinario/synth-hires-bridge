@@ -77,6 +77,8 @@ pub enum DaemonError {
     Cancelled,
     #[error("timed out after {0}ms")]
     Timeout(u64),
+    #[error("waiting for owner consent")]
+    AwaitingConsent,
     /// JS-level eval failure: the transport succeeded, the model receives
     /// stdout/stderr and the session stays alive for the next turn.
     #[error("eval failed: {message}")]

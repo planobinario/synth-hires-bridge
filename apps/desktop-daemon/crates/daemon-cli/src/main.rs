@@ -382,14 +382,6 @@ fn main() -> Result<()> {
         "synthhires-bridge",
         native_options,
         Box::new(move |cc| {
-            let checkpoint_store = std::env::var("SYNTHHIRES_CHECKPOINTS")
-                .ok()
-                .filter(|v| v != "off")
-                .and_then(|dir| {
-                    daemon_core::CheckpointStore::open(std::path::Path::new(&dir))
-                        .map(std::sync::Arc::new)
-                        .ok()
-                });
             let app = ui::BridgeApp::new(
                 cc,
                 status_rx,
@@ -400,8 +392,7 @@ fn main() -> Result<()> {
                 chat_store.clone(),
                 consent_broker_ui,
                 ws_health.clone(),
-            )
-            .with_checkpoints(checkpoint_store);
+            );
             let mut w_ctx = ui_ctx.blocking_write();
             *w_ctx = Some(cc.egui_ctx.clone());
             Ok(Box::new(app))
@@ -1205,6 +1196,7 @@ fn cmd_verify(path: std::path::PathBuf, json: bool) -> Result<()> {
         let gate = CapabilityGate::new(ScopeSnapshot {
             capabilities: vec!["desktop.fs.verify".into()],
             always_allow_paths: vec![],
+            one_shot_paths: vec![],
         });
         let ops = daemon_core::FsOps::new(&gate);
         ops.verify(daemon_core::fs_ops::FsVerifyRequest { path: path.clone() })

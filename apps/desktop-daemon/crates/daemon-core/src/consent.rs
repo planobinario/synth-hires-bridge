@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone)]
 pub struct ConsentPrompt {
@@ -38,12 +38,27 @@ struct ConsentState {
 
 pub struct ConsentBroker {
     state: Mutex<ConsentState>,
+    /// Wake-up channel for the WS read loop: the loop must NEVER block on a
+    /// consent (it would stop reading heartbeats/acks/consent_responses —
+    /// a self-inflicted zombie). Instead, whoever answers (web relay frame
+    /// handled by the loop itself, or the local egui UI) goes through
+    /// `answer()`, which pushes the decision here so the loop's select!
+    /// can resume the parked action.
+    notifier: Mutex<Option<mpsc::UnboundedSender<(String, ConsentAnswer)>>>,
 }
 
 impl ConsentBroker {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(ConsentState::default()),
+            notifier: Mutex::new(None),
+        }
+    }
+
+    /// The WS client installs its decision channel at startup.
+    pub fn set_notifier(&self, tx: mpsc::UnboundedSender<(String, ConsentAnswer)>) {
+        if let Ok(mut n) = self.notifier.lock() {
+            *n = Some(tx);
         }
     }
 
@@ -69,15 +84,28 @@ impl ConsentBroker {
     /// UI-side answer. Returns false when the prompt no longer exists
     /// (already answered, or the WS caller timed out).
     pub fn answer(&self, action_id: &str, answer: ConsentAnswer) -> bool {
-        let Ok(mut st) = self.state.lock() else {
-            return false;
+        let resolved = {
+            let Ok(mut st) = self.state.lock() else {
+                return false;
+            };
+            if let Some((_, tx)) = st.pending.remove(action_id) {
+                let _ = tx.send(answer);
+                true
+            } else {
+                false
+            }
         };
-        if let Some((_, tx)) = st.pending.remove(action_id) {
-            let _ = tx.send(answer);
-            true
-        } else {
-            false
+        if resolved {
+            // Wake the parked action regardless of who answered (web or
+            // local UI). Fire-and-forget: a missing/late receiver just
+            // means the action was already swept.
+            if let Ok(n) = self.notifier.lock() {
+                if let Some(tx) = n.as_ref() {
+                    let _ = tx.send((action_id.to_string(), answer));
+                }
+            }
         }
+        resolved
     }
 }
 

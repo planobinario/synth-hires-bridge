@@ -21,6 +21,16 @@ pub struct ScopeSnapshot {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub always_allow_paths: Vec<PathBuf>,
+    /// Paths the owner approved THIS action (one-shot consent, web or
+    /// local dialog). NOT persisted: the next action must ask again.
+    /// The symlink-escape guard checks these LITERALLY — the owner saw
+    /// this exact path on their screen; a nonexistent target resolving
+    /// through an existing ancestor (/tmp → /) must not silently void
+    /// the approval they just gave. Pre-planted symlinks AT the target
+    /// remain protected: check_path would return RequireConsent before
+    /// this list is consulted.
+    #[serde(default, skip_serializing)]
+    pub one_shot_paths: Vec<PathBuf>,
 }
 
 impl From<&Scopes> for ScopeSnapshot {
@@ -28,6 +38,7 @@ impl From<&Scopes> for ScopeSnapshot {
         ScopeSnapshot {
             capabilities: s.capabilities.clone(),
             always_allow_paths: s.always_allow_paths.iter().map(PathBuf::from).collect(),
+            one_shot_paths: Vec::new(),
         }
     }
 }
@@ -64,6 +75,15 @@ impl CapabilityGate {
         Self { snapshot }
     }
 
+    /// One-shot (this action only) path authorization from an explicit
+    /// owner consent. Literally-checked by the symlink guard, see
+    /// ScopeSnapshot.one_shot_paths.
+    pub fn with_one_shot_path(&self, path: PathBuf) -> Self {
+        let mut snapshot = self.snapshot.clone();
+        snapshot.one_shot_paths.push(path);
+        Self { snapshot }
+    }
+
     pub fn allows(&self, capability: &str) -> bool {
         self.snapshot.capabilities.iter().any(|c| c == capability)
     }
@@ -77,6 +97,12 @@ impl CapabilityGate {
     pub fn check_path(&self, capability: &str, path: &Path) -> GateDecision {
         if !self.allows(capability) {
             return GateDecision::Deny;
+        }
+        // One-shot owner consent covers the exact approved path (lexical
+        // check here; the real-resolution guard in check_path_real also
+        // honours it — see one_shot_paths docs for the threat model).
+        if self.snapshot.one_shot_paths.iter().any(|p| p == path) {
+            return GateDecision::Allow;
         }
         if self.path_matches_any(path) {
             return GateDecision::Allow;
@@ -124,6 +150,15 @@ impl CapabilityGate {
                         },
                     }
                 };
+                // One-shot consent covers the exact path the owner saw.
+                let one_shot_ok = self
+                    .snapshot
+                    .one_shot_paths
+                    .iter()
+                    .any(|p| p == path);
+                if one_shot_ok {
+                    return Ok(GateDecision::Allow);
+                }
                 // La ruta REAL debe vivir bajo un root permitido — comparada
                 // contra los prefixes léxicos Y su forma canónica: en macOS
                 // `/var -> /private/var` (el TMPDIR solo matchea canónicamente)
@@ -160,6 +195,7 @@ mod tests {
         let snap = ScopeSnapshot {
             capabilities: vec!["desktop.fs.read".into(), "desktop.fs.write".into()],
             always_allow_paths: prefixes.iter().map(PathBuf::from).collect(),
+            one_shot_paths: vec![],
         };
         CapabilityGate::new(snap)
     }

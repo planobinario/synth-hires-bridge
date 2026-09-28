@@ -202,6 +202,11 @@ pub struct ConsentPromptFrame {
     pub capability: String,
     pub summary: String,
     pub params_hash: String,
+    /// Optional path the consent targets (protocol v1.3): the web cockpit
+    /// renders it. Older servers omit it.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

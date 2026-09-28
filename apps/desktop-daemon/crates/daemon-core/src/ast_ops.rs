@@ -394,6 +394,7 @@ mod tests {
         let snap = ScopeSnapshot {
             capabilities: vec!["desktop.fs.read".into(), "desktop.fs.write".into()],
             always_allow_paths: vec![dir.to_path_buf()],
+            one_shot_paths: vec![],
         };
         CapabilityGate::new(snap)
     }

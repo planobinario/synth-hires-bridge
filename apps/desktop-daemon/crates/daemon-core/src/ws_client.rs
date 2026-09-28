@@ -38,6 +38,23 @@ type WsStream =
 /// with the canonical ok=true/None pairing, and `send_error` on op failure.
 /// Arms with non-standard contracts (streaming shell, eval's JS-error
 /// transport, verified-write flags, memory's blocking worker) stay hand-written.
+/// Distinguishes the park marker from real errors inside dispatch_op!:
+/// arms return heterogeneous error types (DaemonError, String,
+/// BrowserError…), so a direct `Err(DaemonError::AwaitingConsent)`
+/// pattern cannot compile against all of them.
+trait ParkMarker {
+    fn is_awaiting_consent(&self) -> bool {
+        false
+    }
+}
+impl ParkMarker for DaemonError {
+    fn is_awaiting_consent(&self) -> bool {
+        matches!(self, DaemonError::AwaitingConsent)
+    }
+}
+impl ParkMarker for String {}
+impl ParkMarker for crate::browser_ops::BrowserError {}
+
 macro_rules! dispatch_op {
     ($self:ident, $ws:ident, $request:ident, $started:ident, $value:ident, $req:ident, $param_ty:ty, $run:block) => {{
         let parsed = serde_json::from_value::<$param_ty>($request.params.clone());
@@ -47,7 +64,11 @@ macro_rules! dispatch_op {
                 // binding, not per arm, so every arm stays symmetric.
                 #[allow(unused_variables)]
                 let $req = &$request;
-                let result = async move {
+                // Reborrow the socket so arms that relay frames (web-first
+                // consent) can use it without moving it out of the caller.
+                let result = async {
+                    let ws: &mut WsStream = &mut *$ws;
+                    let _ = &ws; // silencia unused en brazos sin relay
                     $run
                 }
                 .await;
@@ -64,7 +85,17 @@ macro_rules! dispatch_op {
                             )
                             .await
                     }
-                    Err(error) => $self.send_error($ws, $request.id.clone(), error.to_string()).await,
+                    // Parked for consent: NOT an error — no result frame is
+                    // sent (the action stays pending server-side) and the
+                    // AwaitingConsent marker bubbles up so handle_action
+                    // parks the request. Non-DaemonError arms can never park.
+                    Err(error) => {
+                        if ParkMarker::is_awaiting_consent(&error) {
+                            Err(DaemonError::AwaitingConsent)
+                        } else {
+                            $self.send_error($ws, $request.id.clone(), error.to_string()).await
+                        }
+                    }
                 }
             }
             Err(error) => {
@@ -97,6 +128,16 @@ pub struct WsClient {
     health: Arc<WsHealth>,
     /// Pre-image store for undo. None in tests/android; Some in production.
     checkpoints: Option<Arc<crate::checkpoint::CheckpointStore>>,
+    /// Actions blocked on owner consent, parked OUTSIDE the read loop.
+    /// The loop must never block on a human (it would stop reading
+    /// heartbeats and consent_responses — a self-inflicted zombie).
+    /// Keyed by action id; resumed when the owner answers (web-first
+    /// relay frame handled by this same loop, or the local egui dialog).
+    parked: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, (daemon_protocol::ActionRequestFrame, u64)>,
+        >,
+    >,
 }
 
 impl WsClient {
@@ -147,6 +188,30 @@ impl WsClient {
             consent,
             health,
             checkpoints,
+            parked: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Drop parked actions whose owner never answered within 2 minutes
+    /// (mirrors the cockpit's 3-minute prompt age guard). Called from the
+    /// heartbeat tick — the one code path that runs periodically.
+    async fn sweep_expired_parked(&self) {
+        let now = now_ms();
+        let mut parked = self.parked.lock().await;
+        let expired: Vec<String> = parked
+            .iter()
+            .filter(|(_, (_, at))| now.saturating_sub(*at) > 120_000)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            parked.remove(&id);
+            self.consent.answer(
+                &id,
+                crate::consent::ConsentAnswer {
+                    approved: false,
+                    remember: false,
+                },
+            );
         }
     }
 
@@ -195,9 +260,18 @@ impl WsClient {
     }
 
     pub async fn run(&self) -> Result<()> {
+        // Consent decisions (web relay handled in the loop below, or the
+        // local egui dialog) land here; the connection loop resumes the
+        // parked action.
+        let (consent_tx, mut consent_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(String, crate::consent::ConsentAnswer)>();
+        self.consent.set_notifier(consent_tx);
         let mut backoff = Duration::from_secs(1);
         loop {
-            match self.connect_once(Self::FALLBACK_HEARTBEAT_INTERVAL_MS).await {
+            let connect_result = self
+                .connect_once(Self::FALLBACK_HEARTBEAT_INTERVAL_MS, &mut consent_rx)
+                .await;
+            match connect_result {
                 Ok(()) => {
                     self.health.mark_disconnected();
                     // connect_once returning Ok means the connection ended
@@ -234,7 +308,13 @@ impl WsClient {
     /// today — one source of truth, no config drift.
     const FALLBACK_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
 
-    async fn connect_once(&self, heartbeat_interval_ms: u64) -> Result<()> {
+    async fn connect_once(
+        &self,
+        heartbeat_interval_ms: u64,
+        consent_rx: &mut tokio::sync::mpsc::UnboundedReceiver<
+            (String, crate::consent::ConsentAnswer),
+        >,
+    ) -> Result<()> {
         let mut request = self
             .backend_url
             .clone()
@@ -359,27 +439,63 @@ impl WsClient {
                         _ => {}
                     }
                 }
-                _ = heartbeat.tick() => {
-                    if let Some(t) = expected_heartbeat.take() {
-                        // The previous beat was never acked within its
-                        // grace. One miss is not conclusive; the second
-                        // consecutive miss is a zombie verdict — no TCP
-                        // error will ever surface on a half-dead socket,
-                        // so we must surface it ourselves. Dropping the
-                        // socket hands recovery to the reconnect loop.
-                        consecutive_misses = consecutive_misses.saturating_add(1);
-                        self.health.mark_heartbeat_stale();
-                        let decision = zombie_decision(true, consecutive_misses);
-                        if decision.kill {
-                            tracing::warn!("zombie watchdog: {decision:?}; forcing reconnect");
-                            return Err(DaemonError::Ws(
-                                "heartbeat watchdog: no ack from server".into(),
-                            ));
+                Some(decision) = consent_rx.recv() => {
+                    // A parked action's owner decision arrived — web cockpit
+                    // relay (a consent_response frame handled by this same
+                    // loop) or the local egui dialog. Whoever answered went
+                    // through ConsentBroker::answer(), which already drained
+                    // the internal oneshot; resume WITHOUT the frame wait.
+                    let (action_id, answer) = decision;
+                    if let Some((parked, _at)) = self.parked.lock().await.remove(&action_id) {
+                        if let Err(error) =
+                            self.handle_action(&mut ws, parked, Some(answer)).await
+                        {
+                            if !matches!(error, DaemonError::AwaitingConsent) {
+                                tracing::warn!("parked action {action_id} failed on resume: {error}");
+                            }
                         }
-                        tracing::debug!("heartbeat t={t} unacked (miss {consecutive_misses}/2)");
+                    }
+                    continue;
+                }
+                _ = heartbeat.tick() => {
+                    self.sweep_expired_parked().await;
+                    // Only the OLDEST unacked beat can be judged: a tick
+                    // burst (two ticks in the same millisecond happens when
+                    // the runtime is descheduled under load and intervals
+                    // fire catch-up) must not double-count as two misses —
+                    // the acks may simply still be queued on the socket.
+                    let burst = expected_heartbeat
+                        .map(|t| now_ms().saturating_sub(t) < heartbeat_interval_ms)
+                        .unwrap_or(false);
+                    if let Some(t) = expected_heartbeat.take() {
+                        if burst {
+                            // Catch-up tick for the SAME beat (runtime was
+                            // descheduled): re-arm it and skip this tick —
+                            // sending another beat now would stack beats on
+                            // the wire and miscount the next misses.
+                            expected_heartbeat = Some(t);
+                            continue;
+                        } else {
+                            // The beat is a full interval old and still
+                            // unacked. One miss is not conclusive; the second
+                            // CONSECUTIVE aged miss is a zombie verdict — no
+                            // TCP error will ever surface on a half-dead
+                            // socket, so we must surface it ourselves.
+                            consecutive_misses = consecutive_misses.saturating_add(1);
+                            self.health.mark_heartbeat_stale();
+                            let decision = zombie_decision(true, consecutive_misses);
+                            if decision.kill {
+                                tracing::warn!("zombie watchdog: {decision:?}; forcing reconnect");
+                                return Err(DaemonError::Ws(
+                                    "heartbeat watchdog: no ack from server".into(),
+                                ));
+                            }
+                            tracing::debug!("heartbeat t={t} unacked (miss {consecutive_misses}/2)");
+                        }
                     }
                     let frame = BridgeFrame::Heartbeat(daemon_protocol::HeartbeatFrame { v: PROTOCOL_VERSION, t: now_ms() });
-                    ws.send(Message::Text(serde_json::to_string(&frame)?)).await
+                    ws.send(Message::Text(serde_json::to_string(&frame)?))
+                        .await
                         .map_err(|e| DaemonError::Ws(format!("send heartbeat: {e}")))?;
                     expected_heartbeat = Some(frame_heartbeat_t(&frame));
                 }
@@ -392,9 +508,29 @@ impl WsClient {
             BridgeFrame::ActionRequest(request) if request.capability == "sync.chat.push" => {
                 self.handle_chat_push(ws, request).await
             }
-            BridgeFrame::ActionRequest(request) => self.handle_action(ws, request).await,
+            BridgeFrame::ActionRequest(request) => self.handle_action(ws, request, None).await,
             BridgeFrame::ScopeUpdate(update) => {
                 *self.gate.lock().await = CapabilityGate::new(ScopeSnapshot::from(&update.scopes));
+                Ok(())
+            }
+            BridgeFrame::ConsentResponse(response) => {
+                // Web-first consent: the owner answered from the cockpit.
+                // The DO relays it here; resolve the broker so whichever
+                // surface answers first (web or local egui) decides.
+                let answered = self.consent.answer(
+                    &response.id,
+                    crate::consent::ConsentAnswer {
+                        approved: response.approved,
+                        remember: response.remember,
+                    },
+                );
+                if answered {
+                    // answer() pushed the decision to the notifier; the
+                    // select! in connect_once resumes the parked action.
+                    tracing::debug!("consent {} resuelto desde la web; reanudando", response.id);
+                } else {
+                    tracing::debug!("consent {} ya resuelto localmente; respuesta web descartada", response.id);
+                }
                 Ok(())
             }
             BridgeFrame::Revoke(_) => Err(DaemonError::Protocol("revoked".into())),
@@ -406,10 +542,13 @@ impl WsClient {
         }
     }
 
+    /// `decision` is Some when a parked action is being RESUMED after its
+    /// owner answered (web-first relay or local egui). None on first dispatch.
     async fn handle_action(
         &self,
         ws: &mut WsStream,
         request: daemon_protocol::ActionRequestFrame,
+        decision: Option<crate::consent::ConsentAnswer>,
     ) -> Result<()> {
         self.register_task(&request);
         self.audit(&request);
@@ -469,6 +608,7 @@ impl WsClient {
                 }
                 _ => "desktop.fs.read",
             }
+            "desktop.checkpoint.list" => "desktop.fs.read",
             // The restore arm performs its OWN two-path authorization
             // (explicit grant OR one-shot interactive consent — a server-side
             // skip_consent_prompt flag must never widen what the user can
@@ -510,11 +650,17 @@ impl WsClient {
         }
 
         let started = std::time::Instant::now();
-        match request.capability.as_str() {
+        // Captured BEFORE the match: several arms move request.id (partial
+        // move), and the park block below needs both afterwards.
+        let action_id = request.id.clone();
+        let parked_frame = request.clone();
+        let outcome: Result<()> = match request.capability.as_str() {
             "desktop.fs.read" => {
                 dispatch_op!(self, ws, request, started, value, req, crate::fs_ops::FsReadRequest, {
                     let annotate = value.annotate.unwrap_or(false);
-                    let gate = self.path_gate(req, "desktop.fs.read", &value.path).await?;
+                    let gate = self
+                        .path_gate(ws, req, "desktop.fs.read", &value.path, decision)
+                        .await?;
                     crate::fs_ops::FsOps::new(&gate)
                         .read_annotated(value, annotate)
                         .await
@@ -525,7 +671,10 @@ impl WsClient {
                 let parsed =
                     serde_json::from_value::<crate::fs_ops::FsPatchRequest>(request.params.clone());
                 match parsed {
-                    Ok(value) => match self.path_gate(&request, "desktop.fs.write", &value.path).await {
+                    Ok(value) => match self
+                        .path_gate(ws, &request, "desktop.fs.write", &value.path, decision)
+                        .await
+                    {
                         Ok(gate) => match self.checkpoint_before(&request, &value.path).await {
                             Ok(()) => match crate::fs_ops::FsOps::new(&gate).patch(value).await {
                                 Ok(result) => {
@@ -544,6 +693,10 @@ impl WsClient {
                             },
                             Err(error) => self.send_error(ws, request.id, error).await,
                         },
+                        // Park marker passes through: the request gets parked
+                        // (no result frame), the select loop resumes it when the
+                        // owner answers (web cockpit or local egui).
+                        Err(DaemonError::AwaitingConsent) => Err(DaemonError::AwaitingConsent),
                         Err(error) => self.send_error(ws, request.id, error.to_string()).await,
                     },
                     Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
@@ -553,7 +706,10 @@ impl WsClient {
                 let parsed =
                     serde_json::from_value::<crate::fs_ops::FsWriteRequest>(request.params.clone());
                 match parsed {
-                    Ok(value) => match self.path_gate(&request, "desktop.fs.write", &value.path).await {
+                    Ok(value) => match self
+                        .path_gate(ws, &request, "desktop.fs.write", &value.path, decision)
+                        .await
+                    {
                         Ok(gate) => match self.checkpoint_before(&request, &value.path).await {
                             Ok(()) => match crate::fs_ops::FsOps::new(&gate).write(value).await {
                                 Ok(result) => self.send_action_result(ws, request.id, result.verified, Some(serde_json::json!({"bytes_written": result.bytes_written, "verified": result.verified})), (!result.verified).then_some("write read-back verification failed".into()), elapsed_ms(started)).await,
@@ -561,6 +717,10 @@ impl WsClient {
                             },
                             Err(error) => self.send_error(ws, request.id, error).await,
                         },
+                        // Park marker passes through: the request gets parked
+                        // (no result frame), the select loop resumes it when the
+                        // owner answers (web cockpit or local egui).
+                        Err(DaemonError::AwaitingConsent) => Err(DaemonError::AwaitingConsent),
                         Err(error) => self.send_error(ws, request.id, error.to_string()).await,
                     },
                     Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
@@ -681,6 +841,10 @@ impl WsClient {
                             )
                             .await
                         }
+                        // Park marker passes through: the request gets parked
+                        // (no result frame), the select loop resumes it when the
+                        // owner answers (web cockpit or local egui).
+                        Err(DaemonError::AwaitingConsent) => Err(DaemonError::AwaitingConsent),
                         Err(error) => self.send_error(ws, request.id, error.to_string()).await,
                     },
                     Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
@@ -836,7 +1000,7 @@ impl WsClient {
                 );
                 match parsed {
                     Ok(value) => match self
-                        .path_gate(&request, "desktop.fs.delete", &value.path)
+                        .path_gate(ws, &request, "desktop.fs.delete", &value.path, decision)
                         .await
                     {
                         Ok(gate) => match self.checkpoint_before(&request, &value.path).await {
@@ -894,36 +1058,59 @@ impl WsClient {
                                     )
                                     .await;
                             };
+                            // Resolve the authorization decision:
+                            //   granted → auto-approve (explicit owner grant);
+                            //   resumed → the owner already answered (parked action);
+                            //   otherwise → one-shot consent: relay to the web
+                            //   cockpit (FIRST) + local egui fallback, then PARK.
+                            //   skip_consent_prompt must NEVER auto-run a restore
+                            //   (a server-side flag cannot widen what the user
+                            //   can undo on their own disk).
                             let granted = self.gate.lock().await.allows("desktop.fs.restore");
-                            let authorized = if granted {
-                                true
-                            } else if request.skip_consent_prompt {
-                                false
+                            let resolved = if granted {
+                                Some(crate::consent::ConsentAnswer {
+                                    approved: true,
+                                    remember: false,
+                                })
                             } else {
-                                let rx = self.consent.ask(crate::consent::ConsentPrompt {
-                                    action_id: request.id.clone(),
-                                    capability: "desktop.fs.restore".into(),
-                                    summary: format!(
-                                        "Restaurar {} desde checkpoint",
-                                        entry.path
-                                    ),
-                                    path: Some(entry.path.clone()),
-                                });
-                                matches!(
-                                    tokio::time::timeout(std::time::Duration::from_secs(120), rx).await,
-                                    Ok(Ok(answer)) if answer.approved
-                                )
+                                decision
                             };
-                            if !authorized {
-                                return self
-                                    .send_error(
+                            let resolved = match resolved {
+                                Some(answer) => Some(answer),
+                                None => {
+                                    let relay = daemon_protocol::ConsentPromptFrame {
+                                        v: PROTOCOL_VERSION,
+                                        id: request.id.clone(),
+                                        capability: "desktop.fs.restore".into(),
+                                        summary: format!("Restaurar {} desde checkpoint", entry.path),
+                                        params_hash: String::new(),
+                                        path: Some(entry.path.clone()),
+                                    };
+                                    if let Ok(frame) = serde_json::to_string(
+                                        &daemon_protocol::BridgeFrame::ConsentPrompt(relay),
+                                    ) {
+                                        let _ = ws.send(Message::Text(frame)).await;
+                                    }
+                                    self.consent.ask(crate::consent::ConsentPrompt {
+                                        action_id: request.id.clone(),
+                                        capability: "desktop.fs.restore".into(),
+                                        summary: format!("Restaurar {} desde checkpoint", entry.path),
+                                        path: Some(entry.path.clone()),
+                                    });
+                                    None // park: AwaitingConsent bubbles below
+                                }
+                            };
+                            match resolved {
+                                None => Err(DaemonError::AwaitingConsent),
+                                Some(answer) if !answer.approved => {
+                                    self.send_error(
                                         ws,
                                         request.id,
-                                        "capability_denied: desktop.fs.restore (concede el permiso o responde al diálogo)".into(),
+                                        "capability_denied: desktop.fs.restore (denegado por el owner)".into(),
                                     )
-                                    .await;
-                            } else {
-                                match store.restore(ts) {
+                                    .await
+                                }
+                                Some(_) => match store.restore(ts) {
                                     Ok(rollback) => {
                                         self.send_action_result(
                                             ws,
@@ -944,12 +1131,36 @@ impl WsClient {
                                         self.send_error(ws, request.id, format!("restore failed: {e}"))
                                             .await
                                     }
-                                }
+                                },
                             }
                         }
                     }
                     Err(error) => self.send_error(ws, request.id, format!("bad params: {error}")).await,
                 }
+            }
+            "desktop.checkpoint.list" => {
+                // Undo cockpit (web-first): read-only index for the owner's
+                // control surface. Scope: desktop.fs.read — same tier as the
+                // data it exposes (paths + sizes, never contents).
+                dispatch_op!(self, ws, request, started, value, req, serde_json::Value, {
+                    let _ = value;
+                    let gate = self
+                        .path_gate(ws, req, "desktop.fs.read", std::path::Path::new(""), decision)
+                        .await?;
+                    let _ = gate;
+                    match self.checkpoints.as_ref() {
+                        Some(store) => {
+                            let entries: Vec<serde_json::Value> = store
+                                .list()
+                                .into_iter()
+                                .take(200)
+                                .map(|e| serde_json::to_value(&e).unwrap_or(serde_json::Value::Null))
+                                .collect();
+                            Ok::<_, DaemonError>(serde_json::json!({ "entries": entries }))
+                        }
+                        None => Ok::<_, DaemonError>(serde_json::json!({ "entries": [] })),
+                    }
+                })
             }
             "desktop.fs.verify" => {
                 let parsed = serde_json::from_value::<crate::fs_ops::FsVerifyRequest>(
@@ -977,7 +1188,7 @@ impl WsClient {
                 let parsed = serde_json::from_value::<FsWatchRequest>(request.params.clone());
                 match parsed {
                     Ok(value) => match self
-                        .path_gate(&request, "desktop.fs.watch", &value.path)
+                        .path_gate(ws, &request, "desktop.fs.watch", &value.path, decision)
                         .await
                     {
                         Ok(_) => match watch_filesystem(value).await {
@@ -994,6 +1205,9 @@ impl WsClient {
                             }
                             Err(error) => self.send_error(ws, request.id, error.to_string()).await,
                         },
+                        // Park marker passes through (same contract as the
+                        // other manual fs arms above).
+                        Err(DaemonError::AwaitingConsent) => Err(DaemonError::AwaitingConsent),
                         Err(error) => self.send_error(ws, request.id, error.to_string()).await,
                     },
                     Err(error) => {
@@ -1156,7 +1370,18 @@ impl WsClient {
                 )
                 .await
             }
+        };
+        // The action needed the owner's decision: park it here (NOT in the
+        // read loop) and leave it pending server-side. AwaitingConsent is
+        // the marker — every other error path already sent its result frame.
+        if matches!(outcome, Err(DaemonError::AwaitingConsent)) {
+            self.parked
+                .lock()
+                .await
+                .insert(action_id.clone(), (parked_frame, now_ms()));
+            tracing::debug!("action {action_id} aparcada esperando consentimiento del owner");
         }
+        Ok(())
     }
 
     fn register_task(&self, request: &daemon_protocol::ActionRequestFrame) {
@@ -1216,9 +1441,11 @@ impl WsClient {
     /// skip the dialog by design — that flag IS the consent.
     async fn path_gate(
         &self,
+        ws: &mut WsStream,
         request: &daemon_protocol::ActionRequestFrame,
         capability: &str,
         path: &std::path::Path,
+        decision: Option<crate::consent::ConsentAnswer>,
     ) -> Result<CapabilityGate> {
         if !self.gate.lock().await.allows(capability) {
             return Err(DaemonError::CapabilityDenied(capability.into()));
@@ -1232,31 +1459,75 @@ impl WsClient {
                 .await
                 .with_additional_path(path.to_path_buf()));
         }
-        // Out-of-workspace: ask the human. The dialog renders whenever the
-        // UI is open; headless daemons time out and the action is refused.
-        let rx = self.consent.ask(crate::consent::ConsentPrompt {
+        // A previous "remember" may have persisted this path into the local
+        // gate (or the owner granted it live via scope_update). Without this
+        // check, a remembered path would prompt AGAIN on every action —
+        // remember=true would be a lie.
+        if matches!(
+            self.gate.lock().await.check_path_real(capability, path),
+            Ok(crate::capability::GateDecision::Allow)
+        ) {
+            return Ok(self.gate.lock().await.clone());
+        }
+        // Pre-approved resume (the parked action's owner decision already
+        // arrived — web cockpit or local egui; whoever answered first won).
+        if let Some(answer) = decision {
+            if answer.approved {
+                if answer.remember {
+                    // Persist for future actions: the base gate now trusts
+                    // this path without asking again.
+                    let mut gate = self.gate.lock().await;
+                    *gate = gate.with_additional_path(path.to_path_buf());
+                }
+                // One-shot authorization ALWAYS includes the path (FsOps
+                // re-checks the gate): the owner approved THIS exact path,
+                // so the action must be executable now. remember=false only
+                // means it is NOT persisted for future actions.
+                return Ok(self
+                    .gate
+                    .lock()
+                    .await
+                    .clone()
+                    .with_one_shot_path(path.to_path_buf()));
+            }
+            return Err(DaemonError::CapabilityDenied(format!(
+                "consentimiento denegado por el usuario para {capability} sobre {}",
+                path.display()
+            )));
+        }
+        // Out-of-workspace: ask the human. WEB-FIRST: the prompt is relayed
+        // to the owner's cockpit (DO stores it, lists it at /consents, and
+        // relays the answer back as consent_response → broker → notifier →
+        // this connection's select loop, which resumes the parked action).
+        // The local egui dialog remains a fallback surface; FIRST answer
+        // wins, the loser is discarded by the broker.
+        let relay = daemon_protocol::ConsentPromptFrame {
+            v: PROTOCOL_VERSION,
+            id: request.id.clone(),
+            capability: capability.to_string(),
+            summary: format!("{capability} sobre {}", path.display()),
+            params_hash: String::new(),
+            path: Some(path.display().to_string()),
+        };
+        let frame = serde_json::to_string(&daemon_protocol::BridgeFrame::ConsentPrompt(relay))
+            .unwrap_or_default();
+        if !frame.is_empty() {
+            // Best-effort: a dead socket means the DO also lost the action
+            // polling; the local dialog still decides. The prompt is also
+            // registered in the broker so the egui UI can answer it.
+            let _ = ws.send(Message::Text(frame)).await;
+        }
+        self.consent.ask(crate::consent::ConsentPrompt {
             action_id: request.id.clone(),
             capability: capability.to_string(),
             summary: format!("{capability} sobre {}", path.display()),
             path: Some(path.display().to_string()),
         });
-        match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
-            Ok(Ok(answer)) if answer.approved => {
-                if answer.remember {
-                    let mut gate = self.gate.lock().await;
-                    *gate = gate.with_additional_path(path.to_path_buf());
-                }
-                Ok(self.gate.lock().await.clone())
-            }
-            Ok(Ok(_)) => Err(DaemonError::CapabilityDenied(format!(
-                "consentimiento denegado por el usuario para {capability} sobre {}",
-                path.display()
-            ))),
-            Ok(Err(_)) | Err(_) => Err(DaemonError::CapabilityDenied(format!(
-                "consentimiento no recibido (timeout o UI cerrada) para {capability} sobre {}",
-                path.display()
-            ))),
-        }
+        // CRITICAL: never block this loop on a human. Park the request and
+        // bubble AwaitingConsent; the caller stores it in self.parked and
+        // the select! in connect_once resumes it when the decision lands
+        // (answer() fires the notifier either way — web or local UI).
+        Err(DaemonError::AwaitingConsent)
     }
 
     async fn send_error(&self, ws: &mut WsStream, action_id: String, error: String) -> Result<()> {

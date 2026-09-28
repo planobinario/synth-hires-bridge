@@ -494,6 +494,7 @@ mod tests {
                 "desktop.network.fetch".into(),
             ],
             always_allow_paths: vec![],
+            one_shot_paths: vec![],
         };
         Arc::new(Mutex::new(CapabilityGate::new(snapshot)))
     }

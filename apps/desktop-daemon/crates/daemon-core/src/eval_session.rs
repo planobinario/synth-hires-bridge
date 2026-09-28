@@ -394,6 +394,7 @@ mod tests {
                 vec![]
             },
             always_allow_paths: vec![],
+            one_shot_paths: vec![],
         };
         Arc::new(Mutex::new(CapabilityGate::new(snap)))
     }

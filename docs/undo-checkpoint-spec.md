@@ -1,16 +1,34 @@
 # Undo / Checkpoint — Especificación
 
-Estado: **IMPLEMENTADO (daemon-core 0.1.21)**. Desviación declarada: blobs SIN
-comprimir (spec original decía zstd) para no añadir dependencias — los límites
-duros acotan el almacén igualmente; comprimir es un cambio puramente local y
-retrocompatible con el índice. Implementación: `daemon-core/src/checkpoint.rs`,
-gancho en `WsClient::checkpoint_before` (invocado tras el gate y antes de
-mutar), capability `desktop.fs.restore` con doble vía (grant explícito o
-diálogo de consentimiento one-shot; `skip_consent_prompt` NUNCA lo autoriza),
-panel "Cambios del agente (deshacer)" en la pestaña Actividad del daemon UI.
-Store: `<config-dir>/checkpoints` (override `SYNTHHIRES_CHECKPOINTS=<dir>`,
-`off` desactiva). Escenario E2E de restauración byte a byte en
-`e2e/full-pipeline.sh` (S9).
+Estado: **IMPLEMENTADO (daemon-core 0.1.21) — CONTROL WEB-FIRST**. Desviación
+declarada: blobs SIN comprimir (spec original decía zstd) para no añadir
+dependencias — los límites duros acotan el almacén igualmente.
+
+**Superficie de control (revisión web-first):** el cockpit es la WEB — el
+daemon corre en background/tray y "se olvida"; el panel egui fue ELIMINADO.
+La web lista el índice y restaura vía `GET/POST /api/devices/:id/checkpoints`
+(mismo pipeline owner-scoped que las acciones del agente). El consentimiento
+necesario (restore sin grant, acciones fuera de workspace) se RELAYA a la web:
+prompt → DO storage → `GET /consents` → owner aprueba/deniega → `POST /consent`
+→ DO retransmite `consent_response` por WS → el daemon REANUDA la acción
+aparca­da. Primera respuesta gana (web o diálogo egui local, que queda como
+fallback); el perdedor se descarta en el ConsentBroker. Crítico: el bucle WS
+del daemon NUNCA se bloquea esperando a un humano — la acción se aparca en
+`WsClient.parked` (expira a los 120s) y el `select!` la reanuda cuando llega
+la decisión; bloquear el bucle lo convertía en un zombi autoinfligido (sin
+heartbeats ni acks). Autorización one-shot: el path aprobado vale SOLO para
+esa acción (`ScopeSnapshot.one_shot_paths`, verificación léxica que no anula
+la aprobación cuando el target no existe aún); `remember=true` sí persiste
+en el gate local. `skip_consent_prompt` NUNCA auto-ejecuta un restore.
+
+Implementación: `daemon-core/src/checkpoint.rs`, gancho en
+`WsClient::checkpoint_before` (invocado tras el gate y antes de mutar),
+capability `desktop.fs.restore` con doble vía (grant explícito o
+consentimiento one-shot web-first). Store: `<config-dir>/checkpoints`
+(override `SYNTHHIRES_CHECKPOINTS=<dir>`, `off` desactiva). Escenario E2E de
+restauración byte a byte en `e2e/full-pipeline.sh` (S8); batería de
+consentimiento web (aparcar → aprobar → escribir / denegar → respetado /
+remember → auto) verificada contra daemon real.
 
 Motivación: hoy `fs_write`, `fs_patch` y `fs_delete` sobrescriben/borran sin
 pre-imagen recuperable. Un agente que se equivoca destruye trabajo del usuario
@@ -42,10 +60,13 @@ puede equivocarse sin pérdida".
    por otro.
 7. **Sobrescritura segura del restore**: antes de restaurar, la versión ACTUAL
    se checkpointea también (el undo es reversible en ambos sentidos).
-8. **UI**: panel "Actividad" (daemon-cli/ui.rs) lista los últimos checkpoints
-   con origen (action_id, capability, path) y botón restaurar; el web muestra el
-   mismo índice vía nuevo endpoint `GET /api/devices/:id/checkpoints` (solo
-   índice, contenido nunca viaja por red salvo restore explícito).
+8. **UI (web-first)**: el control de checkpoints vive en la web
+   (`device-checkpoints.tsx` en la ficha del dispositivo; polling 6s con
+   guard de visibilidad) con botones Deshacer/Borrar según `existed`.
+   `desktop.checkpoint.list` es de solo lectura (índice: paths + tamaños,
+   nunca contenidos salvo restore explícito) y mapea al tier `desktop.fs.read`
+   en servidor y daemon. El consentimiento pendiente se muestra en
+   `device-consents.tsx` (mismo sheet, arriba del todo).
 
 ## No-goals explícitos
 

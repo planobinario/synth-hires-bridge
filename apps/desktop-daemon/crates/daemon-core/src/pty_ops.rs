@@ -586,6 +586,7 @@ mod tests {
         let snapshot = ScopeSnapshot {
             capabilities: vec!["desktop.shell.execute".into()],
             always_allow_paths: vec![],
+            one_shot_paths: vec![],
         };
         Arc::new(Mutex::new(CapabilityGate::new(snapshot)))
     }
