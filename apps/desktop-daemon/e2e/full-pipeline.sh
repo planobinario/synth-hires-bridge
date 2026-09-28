@@ -338,6 +338,56 @@ else
   bad "S8: checkpoint de pre-imagen no encontrado en indice (capture no cableado?)"
 fi
 
+# S10: consent-relay web-first (docs/undo-checkpoint-spec.md)
+# Acción FUERA de alwaysAllowPaths → el daemon la aparca y relay­a el prompt
+# → el owner responde vía la API web (la MISMA llamada que dispara el drawer
+# unificado del chat input) → el DO retransmite consent_response por WS → el
+# daemon reanuda la acción aparca­da. Sin consentimiento web-first, una acción
+# fuera de workspace en un daemon headless moriría por timeout.
+RELAY_DIR="/tmp/sh-e2e-relay-$$"
+R=$(ACTION desktop.fs.write "{\"path\":\"$RELAY_DIR/s10.txt\",\"content\":\"S10-OK\"}")
+AID=$(echo "$R" | JGET data.actionId 2>/dev/null)
+# El prompt debe aparecer en la cola del DO (visible para el cockpit web).
+PROMPT_ID=$(curl -s -m 15 "$BASE/api/devices/$DEV_ID/consents" \
+  -H "Origin: $BASE" -b "$E2E_ROOT/owner.jar" | python3 -c "
+import json,sys
+cs=json.load(sys.stdin).get('consents',[])
+print(cs[0]['id'] if cs else '')" 2>/dev/null)
+if [[ -n "$PROMPT_ID" ]]; then
+  ok "S10 prompt relayado al cockpit web (prompt_id ${PROMPT_ID:0:8})"
+  # El owner aprueba desde la web → decisión real al daemon.
+  curl -s -m 15 -X POST "$BASE/api/devices/$DEV_ID/consent" \
+    -H "Origin: $BASE" -H 'Content-Type: application/json' -b "$E2E_ROOT/owner.jar" \
+    -d "{\"id\":\"$PROMPT_ID\",\"approved\":true,\"remember\":false}" >/dev/null
+  sleep 4
+  [[ "$(cat "$RELAY_DIR/s10.txt" 2>/dev/null)" == "S10-OK" ]] \
+    && ok "S10 aprobado desde la web → acción reanudada y ejecutada" \
+    || bad "S10 aprobado pero la acción no se ejecutó (resume roto?)"
+else
+  bad "S10: el prompt no llegó a la cola del DO (relay roto?): $R"
+fi
+rm -rf "$RELAY_DIR"
+
+# S10b: denegación desde la web → la acción NO se ejecuta y el one-shot no persiste.
+R=$(ACTION desktop.fs.write "{\"path\":\"$RELAY_DIR/denegado.txt\",\"content\":\"NO\"}")
+PROMPT_ID=$(curl -s -m 15 "$BASE/api/devices/$DEV_ID/consents" \
+  -H "Origin: $BASE" -b "$E2E_ROOT/owner.jar" | python3 -c "
+import json,sys
+cs=json.load(sys.stdin).get('consents',[])
+print(cs[0]['id'] if cs else '')" 2>/dev/null)
+if [[ -n "$PROMPT_ID" ]]; then
+  curl -s -m 15 -X POST "$BASE/api/devices/$DEV_ID/consent" \
+    -H "Origin: $BASE" -H 'Content-Type: application/json' -b "$E2E_ROOT/owner.jar" \
+    -d "{\"id\":\"$PROMPT_ID\",\"approved\":false,\"remember\":false}" >/dev/null
+  sleep 3
+  [[ ! -e "$RELAY_DIR/denegado.txt" ]] \
+    && ok "S10b denegación web respetada (fichero no creado)" \
+    || bad "S10b: fichero creado pese a denegación web"
+else
+  bad "S10b: segundo prompt no apareció (one-shot debería re-preguntar)"
+fi
+rm -rf "$RELAY_DIR"
+
 # ─── Resumen ────────────────────────────────────────────────────────────────
 log "══════════════════════════════════════"
 log "PASS=$PASS FAIL=$FAIL"
