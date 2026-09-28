@@ -24,6 +24,58 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
+/// Hard resource limits for shell execution (sandboxing that does not
+/// depend on OS containers, works on every platform):
+///
+/// - MAX_TIMEOUT_MS caps a requested timeout: a misbehaving agent must not
+///   be able to park a shell for hours (`timeout_ms: 86_400_000`).
+/// - MAX_OUTPUT_BYTES per stream (stdout, stderr): a command like
+///   `yes` or `cat /dev/urandom` previously grew the accumulator buffers
+///   without bound — a daemon OOM. Past the cap the stream is truncated
+///   (with a marker) and the loop DROPS further data instead of buffering:
+///   the process keeps running but can no longer grow the daemon's memory.
+///   The final result reports `output_truncated: true` honestly.
+/// - Processes still get the full process-tree kill on timeout/cancel
+///   (terminate_child), which is the real containment for runaway work.
+pub struct ShellLimits;
+
+impl ShellLimits {
+    pub const MAX_TIMEOUT_MS: u64 = 10 * 60 * 1000; // 10 min
+    pub const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024; // 4 MiB per stream
+    pub const TRUNCATION_MARKER: &str = "\n…[synthhires: output truncated at 4 MiB]\n";
+    /// Live-stream flush threshold: chunks sent over the WS bridge are
+    /// BATCHED up to this size instead of one frame per line. The DO consumes
+    /// every frame with a storage get+put, so a 1M-line flood as 1M tiny
+    /// frames would drown the Durable Object (observed live: a 576 KB
+    /// socket backlog and the worker wedged). 8 KiB batches cap a 4 MiB
+    /// stream at ~512 frames — bounded work for the consumer.
+    pub const STREAM_FLUSH_BYTES: usize = 8 * 1024;
+
+    pub fn clamp_timeout(requested: Option<u64>) -> u64 {
+        let t = requested.unwrap_or(30_000);
+        t.min(Self::MAX_TIMEOUT_MS).max(1_000)
+    }
+}
+
+fn push_capped(buf: &mut String, data: &str, dropped: &mut bool) {
+    if buf.len() >= ShellLimits::MAX_OUTPUT_BYTES {
+        *dropped = true;
+        return; // hard drop: no memory growth past the cap
+    }
+    if buf.len() + data.len() > ShellLimits::MAX_OUTPUT_BYTES {
+        let space = ShellLimits::MAX_OUTPUT_BYTES - buf.len();
+        let cut = match data.char_indices().nth(space) {
+            Some((i, _)) => i,
+            None => data.len(),
+        };
+        buf.push_str(&data[..cut]);
+        buf.push_str(ShellLimits::TRUNCATION_MARKER);
+        *dropped = true;
+        return;
+    }
+    buf.push_str(data);
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ShellRequest {
     pub command: String,
@@ -45,6 +97,10 @@ pub struct ShellResult {
     pub stdout: String,
     pub stderr: String,
     pub duration_ms: u64,
+    /// Honest signal: a stream hit the hard cap and data was dropped.
+    /// The consumer (agent) knows the output is INCOMPLETE.
+    #[serde(default)]
+    pub output_truncated: bool,
 }
 
 pub struct ShellRunner<'a> {
@@ -69,7 +125,7 @@ impl<'a> ShellRunner<'a> {
                 "desktop.shell.execute".into(),
             ));
         }
-        let timeout = req.timeout_ms.unwrap_or(30_000);
+        let timeout = ShellLimits::clamp_timeout(req.timeout_ms);
         // NOTE: `cfg!` (runtime) compiles BOTH branches on every target, and
         // `tokio::process::Command::raw_arg` only exists on Windows — so this
         // must be a compile-time `#[cfg]`, or the Unix build fails.
@@ -119,48 +175,123 @@ impl<'a> ShellRunner<'a> {
         let (tx, rx) = mpsc::channel::<ShellOutputChunk>(64);
 
         // Accumulated buffers so the final result carries the REAL
-        // output (previous code returned empty strings).
+        // output (previous code returned empty strings). Hard-capped:
+        // see ShellLimits — past the cap data is DROPPED, not buffered.
         let stdout_buf = Arc::new(Mutex::new(String::new()));
         let stderr_buf = Arc::new(Mutex::new(String::new()));
+        let stdout_dropped = Arc::new(Mutex::new(false));
+        let stderr_dropped = Arc::new(Mutex::new(false));
 
-        // Stdout pump: broadcast to the stream AND accumulate.
+        // Stdout pump: batch to the stream AND accumulate (capped).
+        // Past the cap the live stream STOPS broadcasting (one final marker
+        // chunk) while the reader keeps draining the pipe so the child is
+        // never blocked by a full stdout buffer.
         let txo = tx.clone();
         let acco = stdout_buf.clone();
+        let dropo = stdout_dropped.clone();
         let stdout_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
+            let mut pending = String::new();
+            let mut stream_stopped = false;
             while let Ok(Some(line)) = lines.next_line().await {
                 let data = format!("{}\n", line);
-                acco.lock().await.push_str(&data);
-                if txo
-                    .send(ShellOutputChunk {
-                        channel: "stdout",
-                        data,
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
+                push_capped(&mut *acco.lock().await, &data, &mut *dropo.lock().await);
+                if *dropo.lock().await {
+                    if !stream_stopped {
+                        // Flush what was batched so far, then the marker.
+                        if !pending.is_empty() {
+                            let _ = txo
+                                .send(ShellOutputChunk {
+                                    channel: "stdout",
+                                    data: std::mem::take(&mut pending),
+                                })
+                                .await;
+                        }
+                        let _ = txo
+                            .send(ShellOutputChunk {
+                                channel: "stdout",
+                                data: ShellLimits::TRUNCATION_MARKER.to_string(),
+                            })
+                            .await;
+                        stream_stopped = true;
+                    }
+                    continue; // keep DRAINING the pipe, but don't broadcast
+                }
+                pending.push_str(&data);
+                if pending.len() >= ShellLimits::STREAM_FLUSH_BYTES {
+                    if txo
+                        .send(ShellOutputChunk {
+                            channel: "stdout",
+                            data: std::mem::take(&mut pending),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             }
+            if !pending.is_empty() {
+                let _ = txo
+                    .send(ShellOutputChunk {
+                        channel: "stdout",
+                        data: pending,
+                    })
+                    .await;
+            }
         });
-        // Stderr pump: broadcast to the stream AND accumulate.
+        // Stderr pump: same batching + stop-at-cap policy.
         let txe = tx.clone();
         let acce = stderr_buf.clone();
+        let drope = stderr_dropped.clone();
         let stderr_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
+            let mut pending = String::new();
+            let mut stream_stopped = false;
             while let Ok(Some(line)) = lines.next_line().await {
                 let data = format!("{}\n", line);
-                acce.lock().await.push_str(&data);
-                if txe
+                push_capped(&mut *acce.lock().await, &data, &mut *drope.lock().await);
+                if *drope.lock().await {
+                    if !stream_stopped {
+                        if !pending.is_empty() {
+                            let _ = txe
+                                .send(ShellOutputChunk {
+                                    channel: "stderr",
+                                    data: std::mem::take(&mut pending),
+                                })
+                                .await;
+                        }
+                        let _ = txe
+                            .send(ShellOutputChunk {
+                                channel: "stderr",
+                                data: ShellLimits::TRUNCATION_MARKER.to_string(),
+                            })
+                            .await;
+                        stream_stopped = true;
+                    }
+                    continue;
+                }
+                pending.push_str(&data);
+                if pending.len() >= ShellLimits::STREAM_FLUSH_BYTES {
+                    if txe
+                        .send(ShellOutputChunk {
+                            channel: "stderr",
+                            data: std::mem::take(&mut pending),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+            if !pending.is_empty() {
+                let _ = txe
                     .send(ShellOutputChunk {
                         channel: "stderr",
-                        data,
+                        data: pending,
                     })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
+                    .await;
             }
         });
 
@@ -172,6 +303,8 @@ impl<'a> ShellRunner<'a> {
             tx,
             stdout_buf,
             stderr_buf,
+            stdout_dropped,
+            stderr_dropped,
             stdout_task,
             stderr_task,
         };
@@ -190,6 +323,8 @@ pub struct ShellResultFuture {
     tx: mpsc::Sender<ShellOutputChunk>,
     stdout_buf: Arc<Mutex<String>>,
     stderr_buf: Arc<Mutex<String>>,
+    stdout_dropped: Arc<Mutex<bool>>,
+    stderr_dropped: Arc<Mutex<bool>>,
     stdout_task: tokio::task::JoinHandle<()>,
     stderr_task: tokio::task::JoinHandle<()>,
 }
@@ -220,11 +355,14 @@ impl ShellResultFuture {
             Ok(Ok(Some(status))) => {
                 let stdout_buf = self.stdout_buf.lock().await.clone();
                 let stderr_buf = self.stderr_buf.lock().await.clone();
+                let output_truncated =
+                    *self.stdout_dropped.lock().await || *self.stderr_dropped.lock().await;
                 Ok(ShellResult {
                     exit_code: status.code(),
                     stdout: stdout_buf,
                     stderr: stderr_buf,
                     duration_ms: self.started_at.elapsed().as_millis() as u64,
+                    output_truncated,
                 })
             }
             Ok(Ok(None)) => Err(DaemonError::Cancelled),
@@ -295,5 +433,86 @@ mod tests {
         let result = future.await_result().await;
         assert!(matches!(result, Err(DaemonError::Cancelled)));
         drain.await.expect("output drain should finish");
+    }
+
+    #[test]
+    fn timeout_is_clamped_to_the_hard_cap() {
+        assert_eq!(ShellLimits::clamp_timeout(None), 30_000);
+        assert_eq!(ShellLimits::clamp_timeout(Some(5_000)), 5_000);
+        // A day-long timeout collapses to the cap.
+        assert_eq!(
+            ShellLimits::clamp_timeout(Some(86_400_000)),
+            ShellLimits::MAX_TIMEOUT_MS
+        );
+        // Degenerate values floor at 1s (never 0 — an instant timeout is a bug).
+        assert_eq!(ShellLimits::clamp_timeout(Some(0)), 1_000);
+    }
+
+    #[tokio::test]
+    async fn output_past_the_cap_is_dropped_and_honestly_reported() {
+        let gate = CapabilityGate::new(ScopeSnapshot {
+            capabilities: vec!["desktop.shell.execute".into()],
+            always_allow_paths: Vec::new(),
+            one_shot_paths: vec![],
+        });
+        // Far more than 4 MiB on stdout (~6.9 MB from seq 1 1_000_000).
+        // The daemon must survive with a bounded buffer and report the
+        // truncation honestly.
+        let command = if cfg!(target_os = "windows") {
+            "powershell -Command \"for($i=0;$i -lt 900000;$i++){ Write-Output 0123456789 }\""
+        } else {
+            "seq 1 1000000"
+        };
+        let (mut output, future) = ShellRunner::new(&gate)
+            .run(
+                ShellRequest {
+                    command: command.into(),
+                    cwd: None,
+                    timeout_ms: Some(60_000),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("shell child should spawn");
+        // Drain the stream while running (the required contract).
+        let drain = tokio::spawn(async move { while output.recv().await.is_some() {} });
+        let result = future.await_result().await.expect("shell result");
+        drain.await.expect("output drain should finish");
+        assert!(
+            result.output_truncated,
+            "1M lines (~6.9MB) must trip the 4MiB cap and be reported"
+        );
+        assert!(
+            result.stdout.len() <= ShellLimits::MAX_OUTPUT_BYTES + 200,
+            "buffer must stay bounded: {} bytes",
+            result.stdout.len()
+        );
+        assert!(result.stdout.contains("[synthhires: output truncated"));
+    }
+
+    #[tokio::test]
+    async fn normal_output_is_not_marked_truncated() {
+        let gate = CapabilityGate::new(ScopeSnapshot {
+            capabilities: vec!["desktop.shell.execute".into()],
+            always_allow_paths: Vec::new(),
+            one_shot_paths: vec![],
+        });
+        let command = if cfg!(target_os = "windows") { "echo hi" } else { "echo hi" };
+        let (mut output, future) = ShellRunner::new(&gate)
+            .run(
+                ShellRequest {
+                    command: command.into(),
+                    cwd: None,
+                    timeout_ms: Some(10_000),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("shell child should spawn");
+        let drain = tokio::spawn(async move { while output.recv().await.is_some() {} });
+        let result = future.await_result().await.expect("shell result");
+        drain.await.expect("output drain should finish");
+        assert!(!result.output_truncated);
+        assert!(result.stdout.contains("hi"));
     }
 }

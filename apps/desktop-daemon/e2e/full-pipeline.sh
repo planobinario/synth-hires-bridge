@@ -388,6 +388,42 @@ else
 fi
 rm -rf "$RELAY_DIR"
 
+# S11: sandboxing — hard resource limits y señales honestas.
+# Un `seq 1 1000000` (~6.9 MB de stdout) debe: (a) truncarse a 4 MiB/stream
+# con marker y flag honesto `output_truncated`, (b) NO matar al daemon ni
+# ahogar el DO (el stream se BATCHEA a 8 KiB/frame en vez de 1 frame/línea —
+# sin batching el worker acaba con un backlog de 576 KB y wedged).
+R=$(ACTION desktop.shell.execute '{"command":"seq 1 1000000"}')
+echo "$R" | grep -q '"output_truncated":true' \
+  && ok "S11a flood: output_truncated honesto" \
+  || bad "S11a flood sin señal de truncado: $(echo "$R" | head -c 200)"
+echo "$R" | grep -q 'synthhires: output truncated' \
+  && ok "S11a flood: marker en la cola del stream" \
+  || bad "S11a marker ausente"
+R=$(ACTION desktop.shell.execute '{"command":"echo alive"}')
+echo "$R" | grep -q 'alive' \
+  && ok "S11b daemon vivo tras el flood" \
+  || bad "S11b daemon no responde tras flood: $R"
+# S11c: fs.write por encima del límite del bridge → 413 accionable (NO un
+# 500 opaco por SQLITE_TOOBIG al persistir el pending en el DO).
+python3 -c "import json;json.dump({'capability':'desktop.fs.write','params':{'path':'/tmp/sh-e2e-s11.txt','content':'x'*(2*1024*1024)},'conversationId':None},open('$E2E_ROOT/s11-big.json','w'))"
+HTTP=$(curl -s -o "$E2E_ROOT/s11-resp.json" -w '%{http_code}' -m 30 -X POST "$BASE/api/devices/$DEV_ID/action" \
+  -H "Origin: $BASE" -H 'Content-Type: application/json' -b "$E2E_ROOT/owner.jar" \
+  --data-binary @"$E2E_ROOT/s11-big.json")
+[[ "$HTTP" == "413" ]] && grep -q 'payload_too_large' "$E2E_ROOT/s11-resp.json" \
+  && ok "S11c fs.write 2MB: 413 payload_too_large accionable" \
+  || bad "S11c: HTTP $HTTP $(head -c 120 "$E2E_ROOT/s11-resp.json")"
+rm -f "$E2E_ROOT/s11-big.json" "$E2E_ROOT/s11-resp.json" /tmp/sh-e2e-s11.txt
+# S11d: fs.read acotado con señal honesta — un fichero de 3000 bytes leído
+# con max_bytes=1000 debe reportar truncated:true (antes se calculaba y se
+# descartaba: el consumidor no podía saber que veía un fichero parcial).
+ACTION desktop.fs.write "{\"path\":\"$WORK/s11-read.txt\",\"content\":\"$(printf 'A%.0s' $(seq 1 3000))\"}" >/dev/null
+R=$(ACTION desktop.fs.read "{\"path\":\"$WORK/s11-read.txt\",\"max_bytes\":1000}")
+echo "$R" | grep -q '"truncated":true' \
+  && ok "S11d fs.read acotado: truncated honesto" \
+  || bad "S11d sin señal de truncado: $(echo "$R" | head -c 200)"
+ACTION desktop.fs.delete "{\"path\":\"$WORK/s11-read.txt\"}" >/dev/null 2>&1
+
 # ─── Resumen ────────────────────────────────────────────────────────────────
 log "══════════════════════════════════════"
 log "PASS=$PASS FAIL=$FAIL"

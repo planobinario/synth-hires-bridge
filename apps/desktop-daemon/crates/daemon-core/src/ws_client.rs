@@ -1327,7 +1327,20 @@ impl WsClient {
                                 match handle.await {
                                     Ok(Ok(result)) => {
                                         let ok = result.exit_code == Some(0);
-                                        self.send_action_result(ws, request.id, ok, Some(serde_json::json!({"exit_code": result.exit_code, "stdout": result.stdout, "stderr": result.stderr})), (!ok).then_some(format!("exit code {:?}", result.exit_code)), result.duration_ms).await
+                                        // `output_truncated` MUST reach the web: it is
+                                        // the honest signal that stdout/stderr is
+                                        // INCOMPLETE (hard-capped at 4 MiB/stream).
+                                        let error = if result.output_truncated {
+                                            (!ok)
+                                                .then_some(format!(
+                                                    "exit code {:?} (output truncated)",
+                                                    result.exit_code
+                                                ))
+                                                .or_else(|| Some("output truncated".into()))
+                                        } else {
+                                            (!ok).then_some(format!("exit code {:?}", result.exit_code))
+                                        };
+                                        self.send_action_result(ws, request.id, ok, Some(serde_json::json!({"exit_code": result.exit_code, "stdout": result.stdout, "stderr": result.stderr, "output_truncated": result.output_truncated})), error, result.duration_ms).await
                                     }
                                     Ok(Err(DaemonError::Cancelled)) => {
                                         self.send_action_result(

@@ -28,6 +28,11 @@ pub struct FsReadRequest {
 pub struct FsReadResult {
     pub content_base64: String,
     pub size: u64,
+    /// Honest signal: the file is BIGGER than what was returned (bounded
+    /// read). Previously computed and discarded — the consumer had no way
+    /// to know it was looking at a partial file.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -94,20 +99,43 @@ impl<'a> FsOps<'a> {
     pub async fn read(&self, req: FsReadRequest) -> Result<FsReadResult> {
         self.gate_for_path("desktop.fs.read", &req.path)?;
         let max = req.max_bytes.unwrap_or(1_048_576).min(10_485_760);
-        let bytes = fs::read(&req.path).await.map_err(DaemonError::Io)?;
-        let truncated = if bytes.len() as u64 > max {
-            &bytes[..max as usize]
-        } else {
-            &bytes[..]
-        };
+        // Bounded read: `fs::read` would load the WHOLE file into memory
+        // before truncating — a 10 GB file read by a curious agent was a
+        // daemon OOM. We stat first and read at most `max` bytes from the
+        // start. `size` reports the REAL file size so the caller knows
+        // what it is not seeing.
+        let meta = fs::metadata(&req.path).await.map_err(DaemonError::Io)?;
+        let total = meta.len();
+        let to_read = (max as u64).min(total) as usize;
+        let mut f = fs::File::open(&req.path).await.map_err(DaemonError::Io)?;
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::with_capacity(to_read);
+        tokio::io::AsyncReadExt::take(&mut f, max as u64)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(DaemonError::Io)?;
+        let truncated = (total as u64) > bytes.len() as u64;
         Ok(FsReadResult {
-            content_base64: base64_encode(truncated),
-            size: truncated.len() as u64,
+            content_base64: base64_encode(&bytes),
+            size: bytes.len() as u64,
+            truncated,
         })
     }
 
     pub async fn write(&self, req: FsWriteRequest) -> Result<FsWriteResult> {
         self.gate_for_path("desktop.fs.write", &req.path)?;
+        // Resource limit: a runaway agent must not be able to exhaust the
+        // disk with a single write (e.g. a generated blob loop). 64 MiB per
+        // write is far above any legitimate source file; larger artifacts
+        // belong to the shell (curl/dd), which has its own output caps.
+        const MAX_WRITE_BYTES: usize = 64 * 1024 * 1024;
+        if req.content.len() > MAX_WRITE_BYTES {
+            return Err(DaemonError::PathDenied(format!(
+                "write rejected: {} bytes exceeds the {} MiB per-write limit",
+                req.content.len(),
+                MAX_WRITE_BYTES / (1024 * 1024)
+            )));
+        }
         let parent = req
             .path
             .parent()
