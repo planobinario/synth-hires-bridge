@@ -154,6 +154,13 @@ impl<'a> ShellRunner<'a> {
         if let Some(cwd) = &req.cwd {
             cmd.current_dir(cwd);
         }
+        // Own process group: the containment kill below targets -pgid, so
+        // the child's whole tree dies (bash -lc 'sleep 300 &'; wait — the
+        // sleep would otherwise survive the timeout as an orphan). CRITICAL
+        // INVARIANT: this must NEVER be removable — if the child stayed in
+        // the daemon's group, kill(-pgid) would kill the daemon itself.
+        #[cfg(unix)]
+        cmd.process_group(0);
         cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null());
@@ -345,6 +352,17 @@ impl ShellResultFuture {
             })
             .await;
 
+        // TERMINATE FIRST, DRAIN AFTER — order is a deadlock invariant.
+        // The pumps exit on EOF from the child's pipes; a timed-out or
+        // errored child is still ALIVE when we get here (its kill only
+        // happens in terminate_child), so draining before killing waits on
+        // EOF that never comes: the runtime wedges (observed live — the
+        // daemon stopped answering actions while `sleep 300 & wait` ran).
+        // Kill the tree first; the closed pipes then end the pumps for free.
+        if !matches!(result, Ok(Ok(Some(_)))) {
+            terminate_child(&mut self.child).await;
+        }
+
         // Drain tx so the pumps don't deadlock, then wait for both output
         // readers before returning the terminal state.
         drop(self.tx);
@@ -367,10 +385,7 @@ impl ShellResultFuture {
             }
             Ok(Ok(None)) => Err(DaemonError::Cancelled),
             Ok(Err(e)) => Err(DaemonError::Io(e)),
-            Err(_) => {
-                terminate_child(&mut self.child).await;
-                Err(DaemonError::Timeout(self.timeout_ms))
-            }
+            Err(_) => Err(DaemonError::Timeout(self.timeout_ms)),
         }
     }
 }
@@ -386,14 +401,40 @@ async fn terminate_child(child: &mut tokio::process::Child) {
         }
         #[cfg(not(target_os = "windows"))]
         {
+            // The child runs in its OWN process group (process_group(0) at
+            // spawn, non-negotiable invariant): pgid == child pid, so a
+            // negative-pid kill reaches the whole tree — backgrounded
+            // grandchildren included. Fallback TERM to the direct pid keeps
+            // containment if the group kill raced an exited leader.
+            let _ = Command::new("kill")
+                .args(["-TERM", &format!("-{pid}")])
+                .status()
+                .await;
             let _ = Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
                 .status()
                 .await;
         }
     }
-    // Fallback if the tree command is unavailable or the child exited after
-    // the PID lookup and before the platform signal was delivered.
+    // Grace: give the tree a moment to flush and exit before escalating.
+    // If the wait completes (group TERM was enough, or the child had
+    // already exited between the pid lookup and the signal), we're done.
+    if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+        .await
+        .is_ok()
+    {
+        return;
+    }
+    // Escalation: TERM ignored (or undeliverable) — SIGKILL is the last
+    // resort, to the GROUP as well (grandchildren that ignored TERM die
+    // too), then the direct child.
+    if let Some(pid) = child.id() {
+        #[cfg(unix)]
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{pid}")])
+            .status()
+            .await;
+    }
     let _ = child.start_kill();
     let _ = child.wait().await;
 }
@@ -433,6 +474,104 @@ mod tests {
         let result = future.await_result().await;
         assert!(matches!(result, Err(DaemonError::Cancelled)));
         drain.await.expect("output drain should finish");
+    }
+
+    /// Regression for the orphan hole: `bash -lc 'sleep 300 & wait'`
+    /// backgrounds a grandchild. A direct-pid kill leaves that sleep alive
+    /// for its full duration; the process-group kill must reap the tree.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_kills_the_whole_process_group() {
+        // Unique token: a sibling test (or a leftover process on this
+        // machine) could otherwise satisfy the pgrep assertion.
+        let token = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let command = format!("sleep 300.{token} & wait");
+        let pattern = format!("sleep 300.{token}");
+        let gate = CapabilityGate::new(ScopeSnapshot {
+            capabilities: vec!["desktop.shell.execute".into()],
+            always_allow_paths: Vec::new(),
+            one_shot_paths: vec![],
+        });
+        let cancellation = CancellationToken::new();
+        let (mut output, future) = ShellRunner::new(&gate)
+            .run(
+                ShellRequest {
+                    command,
+                    cwd: None,
+                    timeout_ms: Some(10_000),
+                },
+                cancellation.clone(),
+            )
+            .await
+            .expect("shell child should spawn");
+        let drain = tokio::spawn(async move { while output.recv().await.is_some() {} });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        cancellation.cancel();
+        let result = future.await_result().await;
+        assert!(matches!(result, Err(DaemonError::Cancelled)));
+        drain.await.expect("output drain should finish");
+
+        // No orphan: the backgrounded sleep must be gone. Poll briefly —
+        // signal delivery is asynchronous but fast.
+        let mut orphan_seen = false;
+        for _ in 0..20 {
+            let out = Command::new("pgrep")
+                .args(["-f", &pattern])
+                .output()
+                .await
+                .expect("pgrep");
+            if out.status.success() {
+                orphan_seen = true;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            } else {
+                orphan_seen = false;
+                break;
+            }
+        }
+        assert!(!orphan_seen, "orphaned grandchild survived the group kill");
+    }
+
+    /// Timeout path: the child tree must be reaped when the clamped
+    /// timeout elapses (not only on explicit cancellation). If this test
+    /// hangs, the runtime wedges exactly like the E2E daemon did.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_reaps_the_whole_process_group() {
+        let token = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let command = format!("sleep 300.{token} & wait");
+        let pattern = format!("sleep 300.{token}");
+        let gate = CapabilityGate::new(ScopeSnapshot {
+            capabilities: vec!["desktop.shell.execute".into()],
+            always_allow_paths: Vec::new(),
+            one_shot_paths: vec![],
+        });
+        let (mut output, future) = ShellRunner::new(&gate)
+            .run(
+                ShellRequest {
+                    command,
+                    cwd: None,
+                    timeout_ms: Some(1_000),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("shell child should spawn");
+        let drain = tokio::spawn(async move { while output.recv().await.is_some() {} });
+        let result = future.await_result().await;
+        assert!(matches!(result, Err(DaemonError::Timeout(1_000))));
+        drain.await.expect("output drain should finish");
+        let out = Command::new("pgrep")
+            .args(["-f", &pattern])
+            .output()
+            .await
+            .expect("pgrep");
+        assert!(!out.status.success(), "orphan survived the timeout kill");
     }
 
     #[test]
