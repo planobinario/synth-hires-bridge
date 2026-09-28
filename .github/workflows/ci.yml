@@ -17,7 +17,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        # ubuntu-24.04 PINNED: `ubuntu-latest` is mid-migration to Ubuntu 26
+        # (per the runner-images deprecation notice) and this build was
+        # repeatedly killed mid-`cargo test` by runner reclaims on the
+        # rolling label — 4 runs in a row, at different points, while the
+        # same commit passed on windows/macos.
+        os: [windows-latest, macos-latest, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
     defaults:
       run:
