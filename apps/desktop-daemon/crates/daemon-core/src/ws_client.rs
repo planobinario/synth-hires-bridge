@@ -93,7 +93,7 @@ pub struct WsClient {
     dap: Arc<crate::dap_ops::DapEngine>,
     mcp: Arc<crate::mcp_ops::McpStore>,
     chat_store: Arc<ChatStore>,
-    _consent: Arc<ConsentBroker>,
+    consent: Arc<ConsentBroker>,
     health: Arc<WsHealth>,
 }
 
@@ -138,7 +138,7 @@ impl WsClient {
                     }),
             ),
             chat_store,
-            _consent: consent,
+            consent,
             health,
         }
     }
@@ -1022,20 +1022,59 @@ impl WsClient {
         });
     }
 
+    /// Resolve the gate for a path-scoped action.
+    ///
+    /// Capability deny is final (scope-level, no dialog can widen it).
+    /// Path-level RequireConsent previously died as a hard error even when
+    /// the egui UI was open — the ConsentBroker existed but nobody called
+    /// `ask()`, so real users saw every out-of-workspace action fail. Now:
+    /// the broker raises the prompt, the UI shows it, and the action waits
+    /// (bounded) for the user's answer. Server pre-approved actions
+    /// (`skip_consent_prompt`, validated against the owner's DB grants)
+    /// skip the dialog by design — that flag IS the consent.
     async fn path_gate(
         &self,
-        _request: &daemon_protocol::ActionRequestFrame,
+        request: &daemon_protocol::ActionRequestFrame,
         capability: &str,
         path: &std::path::Path,
     ) -> Result<CapabilityGate> {
         if !self.gate.lock().await.allows(capability) {
             return Err(DaemonError::CapabilityDenied(capability.into()));
         }
-        Ok(self
-            .gate
-            .lock()
-            .await
-            .with_additional_path(path.to_path_buf()))
+        // Server-side consent: the action route already validated the target
+        // against the device's alwaysAllowPaths in the owner's DB. Trust it.
+        if request.skip_consent_prompt {
+            return Ok(self
+                .gate
+                .lock()
+                .await
+                .with_additional_path(path.to_path_buf()));
+        }
+        // Out-of-workspace: ask the human. The dialog renders whenever the
+        // UI is open; headless daemons time out and the action is refused.
+        let rx = self.consent.ask(crate::consent::ConsentPrompt {
+            action_id: request.id.clone(),
+            capability: capability.to_string(),
+            summary: format!("{capability} sobre {}", path.display()),
+            path: Some(path.display().to_string()),
+        });
+        match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
+            Ok(Ok(answer)) if answer.approved => {
+                if answer.remember {
+                    let mut gate = self.gate.lock().await;
+                    *gate = gate.with_additional_path(path.to_path_buf());
+                }
+                Ok(self.gate.lock().await.clone())
+            }
+            Ok(Ok(_)) => Err(DaemonError::CapabilityDenied(format!(
+                "consentimiento denegado por el usuario para {capability} sobre {}",
+                path.display()
+            ))),
+            Ok(Err(_)) | Err(_) => Err(DaemonError::CapabilityDenied(format!(
+                "consentimiento no recibido (timeout o UI cerrada) para {capability} sobre {}",
+                path.display()
+            ))),
+        }
     }
 
     async fn send_error(&self, ws: &mut WsStream, action_id: String, error: String) -> Result<()> {
