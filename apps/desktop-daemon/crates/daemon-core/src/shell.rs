@@ -430,10 +430,17 @@ async fn terminate_child(child: &mut tokio::process::Child) {
     // too), then the direct child.
     if let Some(pid) = child.id() {
         #[cfg(unix)]
-        let _ = Command::new("kill")
-            .args(["-KILL", &format!("-{pid}")])
-            .status()
-            .await;
+        {
+            let _ = Command::new("kill")
+                .args(["-KILL", &format!("-{pid}")])
+                .status()
+                .await;
+        }
+        // Windows: no POSIX process groups — taskkill /T above already
+        // walks the tree. Consume `pid` so the -D warnings build stays
+        // green on non-unix targets.
+        #[cfg(not(unix))]
+        let _ = pid;
     }
     let _ = child.start_kill();
     let _ = child.wait().await;
