@@ -42,19 +42,17 @@ jobs:
       - name: cargo check
         run: cargo check --bin synthhires-bridge
       # CI debugging profile: `-C debuginfo=0` slashes the link-time RAM
-      # peak of the test binaries. Ubuntu deaths (7 in a row, always during
-      # the compile/link phase of `cargo test`, never inside a test) match
-      # systemd-oomd reaping the job cgroup at the linker memory spike.
-      # Test threads capped at 2 to level the same pressure.
-      # Ubuntu isolates the variable by testing ONLY the lib (no link of the
-      # big daemon-cli binary — the nix-build job already validates that
-      # build on Linux, and windows/macos run the full suite).
-      - name: cargo test (lib only, ubuntu)
-        if: runner.os == 'Linux'
-        run: cargo test --lib --profile ci -- --test-threads=2
-      - name: cargo test (full, non-linux)
-        if: runner.os != 'Linux'
-        run: cargo test --profile ci
+      # peak of the test binaries; threads capped at 2.
+      # NOTE on the ubuntu deaths (8 in a row): they land at RANDOM points
+      # — during linking, during compilation, and once 250ms into test
+      # execution — on TWO different images, with and without debuginfo,
+      # full suite AND lib-only, while windows/macos pass the same commits.
+      # The only surviving correlation: ubuntu is always the LONGEST job of
+      # the run, and GitHub cancels in-flight jobs when an account crosses
+      # its Actions spending limit. Check account billing before blaming
+      # the code (needs `gh auth refresh -s user` to read the API).
+      - name: cargo test
+        run: cargo test --profile ci -- --test-threads=2
       - name: Debug runner death (on failure or cancel)
         if: ${{ !success() && runner.os == 'Linux' }}
         run: |
