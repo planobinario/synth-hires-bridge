@@ -349,3 +349,29 @@ pub fn to_crockford(bytes: &[u8], chars: usize) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cross-implementation lockstep: the TS `Scopes` (bridge-protocol.ts /
+    /// DeviceRecord.scopes) uses camelCase `alwaysAllowPaths`. If the Rust
+    /// side ever renames or un-camelCases the field, live scope_update
+    /// frames silently lose every path (serde default = empty) and every
+    /// action starts asking for consent. Seen in the wild via the E2E
+    /// matrix: fresh grants applied live never took effect.
+    #[test]
+    fn scopes_roundtrip_from_ts_shape() {
+        let ts = r#"{"capabilities":["desktop.fs.read","desktop.shell.execute"],"alwaysAllowPaths":["/tmp/work"]}"#;
+        let scopes: Scopes = serde_json::from_str(ts).expect("TS scopes JSON must deserialize");
+        assert_eq!(scopes.capabilities.len(), 2);
+        assert_eq!(scopes.always_allow_paths.len(), 1, "camelCase alwaysAllowPaths must map to always_allow_paths");
+        assert_eq!(scopes.always_allow_paths[0], "/tmp/work");
+        // And the daemon must emit the same shape back.
+        let wire = serde_json::to_string(&scopes).unwrap();
+        assert!(wire.contains("alwaysAllowPaths"), "wire format must stay camelCase: {wire}");
+        // Missing field (older server) = empty, never an error.
+        let minimal: Scopes = serde_json::from_str("{}").unwrap();
+        assert!(minimal.always_allow_paths.is_empty() && minimal.capabilities.is_empty());
+    }
+}
