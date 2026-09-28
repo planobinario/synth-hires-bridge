@@ -664,7 +664,15 @@ impl WsClient {
                     crate::fs_ops::FsOps::new(&gate)
                         .read_annotated(value, annotate)
                         .await
-                        .map(|r| serde_json::json!({"content_base64": r.content_base64, "size": r.size}))
+                        .map(|r| {
+                            serde_json::json!({
+                                "content_base64": r.content_base64,
+                                "size": r.size,
+                                // Honest signal: the file is bigger than the
+                                // bounded read returned (dropped before).
+                                "truncated": r.truncated,
+                            })
+                        })
                 })
             }
             "desktop.fs.patch" => {
