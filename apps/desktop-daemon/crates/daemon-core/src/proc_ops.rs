@@ -233,13 +233,20 @@ impl ProcEngine {
         let id = Uuid::new_v4();
         let logs = Arc::new(LogRing::default());
         let cancel = CancellationToken::new();
-        let mut child = tokio::process::Command::new(&command)
-            .args(&args)
+        let mut cmd = tokio::process::Command::new(&command);
+        cmd.args(&args)
             .current_dir(&cwd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .stdin(std::process::Stdio::null())
-            .kill_on_drop(false)
+            .kill_on_drop(false);
+        // Own process group on unix: the kill must reach the whole tree —
+        // a dev server that spawns workers would otherwise survive as
+        // orphans. Same non-negotiable invariant as shell.rs: without
+        // this, a negative-pid kill could hit the daemon itself.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("spawn {command}: {e}"))?;
 
@@ -446,6 +453,25 @@ async fn monitor(
 ) {
     let status = tokio::select! {
         _ = cancel.cancelled() => {
+            // Tree kill, same policy as shell.rs: group TERM first, a short
+            // grace for log flush, then SIGKILL to the group (start_kill
+            // alone only reaches the direct child; workers survive it).
+            if let Some(pid) = child.id() {
+                #[cfg(unix)]
+                {
+                    let _ = tokio::process::Command::new("kill")
+                        .args(["-TERM", &format!("-{pid}")])
+                        .status()
+                        .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let _ = tokio::process::Command::new("kill")
+                        .args(["-KILL", &format!("-{pid}")])
+                        .status()
+                        .await;
+                }
+                #[cfg(not(unix))]
+                let _ = pid; // consume so -D warnings stays green on windows
+            }
             let _ = child.start_kill();
             let _ = child.wait().await;
             ProcState::Killed
