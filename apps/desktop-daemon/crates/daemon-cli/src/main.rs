@@ -965,9 +965,25 @@ async fn run_ws_client(
 }
 
 fn hostname() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "unknown".into())
+    // COMPUTERNAME (Windows) / HOSTNAME (shells interactivos) primero; el
+    // fallback REAL es el hostname del kernel: en daemons systemd/launchd y
+    // en contenedores ninguna de las dos variables existe y el usuario veía
+    // "unknown" como nombre del dispositivo en la web.
+    if let Ok(h) = std::env::var("COMPUTERNAME") {
+        if !h.trim().is_empty() {
+            return h;
+        }
+    }
+    if let Ok(h) = std::env::var("HOSTNAME") {
+        if !h.trim().is_empty() {
+            return h;
+        }
+    }
+    let kernel = hostname::get()
+        .map(|h| h.to_string_lossy().trim().trim_end_matches(".local").to_string())
+        .ok()
+        .filter(|h| !h.is_empty() && h != "localhost" && h != "unknown");
+    kernel.unwrap_or_else(|| "Mi equipo".into())
 }
 
 /// Minimal percent-decoder for deep-link query values (RFC 3986).

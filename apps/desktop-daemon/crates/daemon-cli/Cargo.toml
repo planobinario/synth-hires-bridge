@@ -49,6 +49,7 @@ keyring = { workspace = true }
 single-instance = { workspace = true }
 tray-icon = { workspace = true }
 dirs-next = "2"
+hostname = "0.4"
 open = "5"
 image = { version = "0.25", default-features = false, features = ["png", "ico"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Security_Authorization", "Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
