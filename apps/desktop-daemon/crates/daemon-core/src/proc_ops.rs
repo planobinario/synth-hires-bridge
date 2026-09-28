@@ -453,27 +453,40 @@ async fn monitor(
 ) {
     let status = tokio::select! {
         _ = cancel.cancelled() => {
-            // Tree kill, same policy as shell.rs: group TERM first, a short
-            // grace for log flush, then SIGKILL to the group (start_kill
-            // alone only reaches the direct child; workers survive it).
+            // Tree kill, same SAFE policy as shell.rs: group TERM first,
+            // then WAIT — escalate to group SIGKILL only if the child is
+            // STILL ALIVE. Never fire kill(-pid) after an unconditional
+            // sleep: once every group member is gone the kernel frees that
+            // pgid and the pid can be RECYCLED as a fresh group leader —
+            // a blind kill then murders an unrelated group (worst case,
+            // the runner agent itself; suspected in CI deaths).
             if let Some(pid) = child.id() {
                 #[cfg(unix)]
-                {
-                    let _ = tokio::process::Command::new("kill")
-                        .args(["-TERM", &format!("-{pid}")])
-                        .status()
-                        .await;
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let _ = tokio::process::Command::new("kill")
-                        .args(["-KILL", &format!("-{pid}")])
-                        .status()
-                        .await;
-                }
+                let _ = tokio::process::Command::new("kill")
+                    .args(["-TERM", &format!("-{pid}")])
+                    .status()
+                    .await;
                 #[cfg(not(unix))]
                 let _ = pid; // consume so -D warnings stays green on windows
             }
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
+                Ok(_) => {} // group gone (leader reaped); nothing to escalate
+                Err(_) => {
+                    // Still alive after TERM: the pgid is guaranteed live,
+                    // so the group kill cannot hit a recycled id.
+                    if let Some(pid) = child.id() {
+                        #[cfg(unix)]
+                        let _ = tokio::process::Command::new("kill")
+                            .args(["-KILL", &format!("-{pid}")])
+                            .status()
+                            .await;
+                        #[cfg(not(unix))]
+                        let _ = pid;
+                    }
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                }
+            }
             ProcState::Killed
         }
         status = child.wait() => match status {
