@@ -142,7 +142,10 @@ impl std::fmt::Display for OsError {
             Self::UnknownRef(r) => {
                 write!(f, "unknown ref {r} — take a fresh desktop_os_snapshot")
             }
-            Self::BadAction(a) => write!(f, "unknown action '{a}' (press | set_text | select)"),
+            Self::BadAction(a) => write!(
+                f,
+                "unknown action '{a}' (press | press_action | set_text | type_text | press_key | select)"
+            ),
             Self::Rejected(m) => write!(f, "element rejected the action: {m}"),
             Self::Atspi(m) => write!(f, "{m}"),
         }
@@ -334,10 +337,68 @@ impl OsRefs {
 // Engine
 // ---------------------------------------------------------------------------
 
+// Platform dispatch behind one alias: the engine's shape is identical on
+// every OS; only the connection module differs. Non-Linux gets an honest
+// stub whose every call returns NotAvailable with the migration map — the
+// macOS (AXUIElement via the `accessibility` crate, AppKit + Accessibility
+// TCC permission) and Windows (UI Automation via the `uiautomation` crate,
+// COM) backends are slots behind the SAME function signatures.
+#[cfg(all(target_os = "linux", feature = "os"))]
+use linux_backend as platform;
+#[cfg(all(not(target_os = "linux"), feature = "os"))]
+use stub_backend as platform;
+
+/// Platform not built yet: every method fails with this. The message names
+/// the open-source crate + permission the real backend will use, so the
+/// next slice starts from a map instead of from zero.
+#[cfg(all(not(target_os = "linux"), feature = "os"))]
+mod stub_backend {
+    use super::OsError;
+
+    #[derive(Default)]
+    pub(crate) struct LinuxConn;
+
+    pub(crate) async fn connect() -> Result<LinuxConn, OsError> {
+        Err(backend_missing())
+    }
+    pub(crate) async fn list_apps(_conn: &LinuxConn) -> Result<Vec<String>, OsError> {
+        Err(backend_missing())
+    }
+    pub(crate) async fn walk_app(
+        _conn: &LinuxConn,
+        _app: &str,
+    ) -> Result<(Option<String>, Vec<super::OsNode>), OsError> {
+        Err(backend_missing())
+    }
+    pub(crate) async fn do_action_by_identity(
+        _conn: &LinuxConn,
+        _identity: &str,
+        _action: &str,
+        _arg: Option<&str>,
+    ) -> Result<String, OsError> {
+        Err(backend_missing())
+    }
+
+    fn backend_missing() -> OsError {
+        #[cfg(target_os = "macos")]
+        return OsError::NotAvailable(
+            "native macOS backend pending: AXUIElement via the open-source `accessibility` crate; requires the app to hold the Accessibility TCC permission (System Settings > Privacy & Security > Accessibility)",
+        );
+        #[cfg(target_os = "windows")]
+        return OsError::NotAvailable(
+            "native Windows backend pending: UI Automation via the open-source `uiautomation` crate (COM); no special permission needed beyond integrity level",
+        );
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        return OsError::NotAvailable(
+            "no native accessibility backend for this platform (Linux AT-SPI is implemented)",
+        );
+    }
+}
+
 #[cfg(feature = "os")]
 pub struct OsAxEngine {
     /// Lazy platform connection (Linux AT-SPI today).
-    inner: tokio::sync::Mutex<Option<crate::os_ax::linux_backend::LinuxConn>>,
+    inner: tokio::sync::Mutex<Option<platform::LinuxConn>>,
     /// Last snapshot per app: ref → identity (valid across relayouts).
     sessions: tokio::sync::Mutex<std::collections::HashMap<String, OsRefs>>,
 }
@@ -382,7 +443,7 @@ impl OsAxEngine {
     pub async fn apps(&self) -> Result<OsAppsResult, OsError> {
         let mut guard = self.inner.lock().await;
         let conn = Self::ensure_backend_inner(&mut guard).await?;
-        let names = crate::os_ax::linux_backend::list_apps(conn).await?;
+        let names = platform::list_apps(conn).await?;
         Ok(OsAppsResult {
             apps: names.into_iter().map(|name| OsAppEntry { name }).collect(),
         })
@@ -397,7 +458,7 @@ impl OsAxEngine {
         }
         let mut guard = self.inner.lock().await;
         let conn = Self::ensure_backend_inner(&mut guard).await?;
-        let (root_name, nodes) = crate::os_ax::linux_backend::walk_app(conn, &app).await?;
+        let (root_name, nodes) = platform::walk_app(conn, &app).await?;
         let limit = p.limit.unwrap_or(300).clamp(20, 2_000);
         let (text, refs, node_count, truncated) =
             render_tree(&nodes, limit, p.focus.as_deref());
@@ -416,11 +477,15 @@ impl OsAxEngine {
 
     pub async fn act(&self, p: OsActParams) -> Result<OsActResult, OsError> {
         let action = p.action.as_str();
-        if !matches!(action, "press" | "set_text" | "select") {
+        if !matches!(action, "press" | "set_text" | "select" | "press_action" | "type_text") {
             return Err(OsError::BadAction(action.to_string()));
         }
-        if action == "set_text" && p.text.as_deref().unwrap_or("").is_empty() {
-            return Err(OsError::BadAction("set_text needs `text`".into()));
+        if (action == "set_text" || action == "type_text" || action == "press_action")
+            && p.text.as_deref().unwrap_or("").is_empty()
+        {
+            return Err(OsError::BadAction(
+                "set_text/type_text need `text`; press_action needs the NATIVE ACTION NAME in `text`".into(),
+            ));
         }
         if action == "select" && p.text.is_none() {
             return Err(OsError::BadAction(
@@ -442,13 +507,11 @@ impl OsAxEngine {
         }
         let (app, identity) = owner.ok_or(OsError::UnknownRef(p.element_ref))?;
 
-        let detail = crate::os_ax::linux_backend::do_action_by_identity(
-            conn, &identity, action, p.text.as_deref(),
-        )
-        .await?;
+        let detail =
+            platform::do_action_by_identity(conn, &identity, action, p.text.as_deref()).await?;
 
         // Verification snapshot (same app), so the model sees the effect.
-        let (root_name, nodes) = crate::os_ax::linux_backend::walk_app(conn, &app).await?;
+        let (root_name, nodes) = platform::walk_app(conn, &app).await?;
         let (text, refs, node_count, truncated) = render_tree(&nodes, 300, None);
         sessions.insert(app.clone(), OsRefs::new(refs));
         Ok(OsActResult {
@@ -471,10 +534,10 @@ impl OsAxEngine {
     }
 
     async fn ensure_backend_inner(
-        guard: &mut Option<crate::os_ax::linux_backend::LinuxConn>,
-    ) -> Result<&crate::os_ax::linux_backend::LinuxConn, OsError> {
+        guard: &mut Option<platform::LinuxConn>,
+    ) -> Result<&platform::LinuxConn, OsError> {
         if guard.is_none() {
-            *guard = Some(crate::os_ax::linux_backend::connect().await?);
+            *guard = Some(platform::connect().await?);
         }
         Ok(guard.as_ref().expect("just ensured"))
     }
@@ -515,6 +578,7 @@ impl OsAxEngine {
 pub(crate) mod linux_backend {
     use super::{OsError, OsNode, OsNodeStates};
     use atspi::proxy::accessible::AccessibleProxy;
+    use atspi::proxy::device_event_controller::KeySynthType;
     use atspi::proxy::proxy_ext::ProxyExt;
     use atspi::AccessibilityConnection;
     use zbus::names::BusName;
@@ -541,6 +605,13 @@ pub(crate) mod linux_backend {
             // The node simply does not implement the requested interface
             // (no Action, no EditableText…): an element-level refusal.
             OsError::Rejected(s)
+        } else if s.contains("NotSupported") {
+            // Wayland compositors reject at-spi key INJECTION (the registry
+            // answers NotSupported) — an actionable element/session refusal,
+            // never a transport failure.
+            OsError::Rejected(format!(
+                "{s} — keyboard synthesis is blocked on this session (Wayland policy). Use the element's NATIVE actions instead: set_text via EditableText, press via DoAction — they never need input injection"
+            ))
         } else if s.contains("NameHasNoOwner")
             || s.contains("not provided")
             || s.contains("Access denied")
@@ -766,9 +837,51 @@ pub(crate) mod linux_backend {
         out
     }
 
+    /// RAW D-Bus call for GenerateKeyboardEvent. The atspi proxy declares
+    /// the synth type as a `KeySynthType` enum, which zbus serializes as a
+    /// VARIANT — but the registry implements the plain signature `(isu)`
+    /// (keycode i32, keystring s, synth-type u32). Through the proxy the
+    /// call lands as "invalid arguments/NotSupported"; the raw call with
+    /// the exact wire types works (verified against the live registry).
+    ///
+    /// WAYLAND CAVEAT (verified live): the at-spi registry ACCEPTS the call
+    /// but its backend answers NotSupported — on Wayland the compositor
+    /// does not let the registry inject keys. There the honest answer is
+    /// the error below (use the widget's native AX actions, which the
+    /// engine already prefers); X11 sessions synthesize fine.
+    async fn generate_keyboard_event(
+        conn: &zbus::Connection,
+        keycode: i32,
+        keystring: &str,
+        synth: atspi::proxy::device_event_controller::KeySynthType,
+    ) -> Result<(), OsError> {
+        let synth_u32: u32 = match synth {
+            KeySynthType::Press => 0,
+            KeySynthType::Release => 1,
+            KeySynthType::Pressrelease => 2,
+            KeySynthType::Sym => 3,
+            KeySynthType::String => 4,
+            KeySynthType::Lockmodifiers => 5,
+            KeySynthType::Unlockmodifiers => 6,
+        };
+        conn.call_method(
+            Some("org.a11y.atspi.Registry"),
+            "/org/a11y/atspi/registry/deviceeventcontroller",
+            Some("org.a11y.atspi.DeviceEventController"),
+            "GenerateKeyboardEvent",
+            &(keycode, keystring, synth_u32),
+        )
+        .await
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     /// Execute a semantic action on an identity ("destination|/object/path").
     /// press → native default action (index 0, the AXPress equivalent);
     /// set_text → EditableText.SetTextContents (the AXSetValue equivalent);
+    /// type_text → grab_focus + AT-SPI keyboard synthesis (the honest
+    /// fallback for widgets that do not implement EditableText);
+    /// press_action → invoke a NAMED native action by name;
     /// select → Selection.SelectChild (child index from `arg`).
     pub(crate) async fn do_action_by_identity(
         conn: &LinuxConn,
@@ -805,6 +918,36 @@ pub(crate) mod linux_backend {
                     )))
                 }
             }
+            "press_action" => {
+                let wanted = arg
+                    .ok_or_else(|| OsError::BadAction("press_action needs the action NAME in `text`".into()))?
+                    .trim()
+                    .to_string();
+                let ap = px.action().await.map_err(map_err)?;
+                let n = ap.n_actions().await.map_err(map_err)?;
+                let mut names = Vec::with_capacity(n as usize);
+                for i in 0..n {
+                    names.push(ap.get_name(i).await.unwrap_or_default());
+                }
+                let idx = names
+                    .iter()
+                    .position(|a| a.eq_ignore_ascii_case(&wanted))
+                    .ok_or_else(|| {
+                        OsError::Rejected(format!(
+                            "no native action named {wanted:?}. Available: {}",
+                            names.join(", ")
+                        ))
+                    })?;
+                let ok = ap.do_action(idx as i32).await.map_err(map_err)?;
+                if ok {
+                    Ok(format!("pressed native action '{}'", names[idx]))
+                } else {
+                    Err(OsError::Rejected(format!(
+                        "native action '{}' returned false (disabled?)",
+                        names[idx]
+                    )))
+                }
+            }
             "set_text" => {
                 let text = arg.ok_or_else(|| OsError::BadAction("set_text needs `text`".into()))?;
                 let ep = px.editable_text().await.map_err(map_err)?;
@@ -816,6 +959,57 @@ pub(crate) mod linux_backend {
                         "element did not accept SetTextContents (read-only?)".into(),
                     ))
                 }
+            }
+            "type_text" => {
+                let text = arg.ok_or_else(|| OsError::BadAction("type_text needs `text`".into()))?;
+                if text.chars().count() > 4_000 {
+                    return Err(OsError::BadAction(
+                        "type_text is for short input (≤4000 chars); use set_text for full replacement".into(),
+                    ));
+                }
+                // Focus the element first (Component.GrabFocus), then synthesize
+                // the keystrokes through the registry's DeviceEventController —
+                // the same path Orca uses. No window activation, no cursor move.
+                let cp = px.component().await.map_err(map_err)?;
+                cp.grab_focus().await.map_err(map_err)?;
+                generate_keyboard_event(conn.conn.connection(), 0, text, KeySynthType::String)
+                    .await?;
+                // VERIFY-YOUR-WORK: on Wayland the registry accepts the call
+                // but silently drops the injection (compositor policy). Read
+                // the element's text back and refuse to lie about success.
+                let tp = px.text().await;
+                if let Ok(tp) = tp {
+                    let n = tp.character_count().await.unwrap_or(0);
+                    let got = tp.get_text(0, n).await.unwrap_or_default();
+                    if !got.contains(text) {
+                        return Err(OsError::Rejected(
+                            "keyboard synthesis did not land (Wayland blocks at-spi key injection). Use the element's NATIVE actions instead: set_text via EditableText, press via DoAction — those never need input injection".into(),
+                        ));
+                    }
+                }
+                Ok(format!(
+                    "focused element and typed {} chars via keyboard synthesis (verified by read-back)",
+                    text.chars().count()
+                ))
+            }
+            "press_key" => {
+                // One named key (keysym string, e.g. "Return", "Escape",
+                // "Tab", "Down"): Pressrelease on the keysym string.
+                let key = arg
+                    .ok_or_else(|| OsError::BadAction("press_key needs the KEYSYM in `text` (Return, Escape, Tab, Down…)".into()))?
+                    .trim()
+                    .to_string();
+                if key.is_empty() || key.len() > 32 {
+                    return Err(OsError::BadAction("press_key: invalid keysym".into()));
+                }
+                generate_keyboard_event(
+                    conn.conn.connection(),
+                    0,
+                    &key,
+                    KeySynthType::Pressrelease,
+                )
+                .await?;
+                Ok(format!("pressed key '{key}'"))
             }
             "select" => {
                 let idx: i32 = arg
@@ -931,7 +1125,7 @@ mod tests {
     fn unknown_actions_are_rejected_by_contract() {
         assert!(OsError::BadAction("explode".into())
             .to_string()
-            .contains("press | set_text | select"));
+            .contains("press | press_action | set_text | type_text | press_key | select"));
         assert!(OsError::UnknownRef(7).to_string().contains("desktop_os_snapshot"));
         assert!(OsError::UnknownApp("x".into())
             .to_string()
