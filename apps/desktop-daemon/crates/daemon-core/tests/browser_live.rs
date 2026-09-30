@@ -15,10 +15,34 @@
 
 use chromiumoxide::detection::{default_executable, DetectionOptions};
 use daemon_core::browser_ops::{
-    BrowserActParams, BrowserEvalParams, BrowserLaunchParams, BrowserNavigateParams,
-    BrowserStore, MockRule, MockSetParams, SnapshotParams, TabCloseParams, TabOpenParams,
-    TabSelectParams, WaitParams,
+    BrowserActParams, BrowserError, BrowserEvalParams, BrowserLaunchParams, BrowserLaunchResult,
+    BrowserNavigateParams, BrowserStore, MockRule, MockSetParams, SnapshotParams, TabCloseParams,
+    TabOpenParams, TabSelectParams, WaitParams,
 };
+
+// Transient CDP navigate timeouts during launch ("navigate: Request timed
+// out.") have killed CI jobs on slow runners (observed once on
+// windows-latest) while the same code passed elsewhere. A failed launch
+// leaves NO session behind — sessions.insert happens only after the initial
+// navigate — so a single retry of the whole launch is safe (relaunch also
+// closes any previous session). Only CDP errors are retried; a genuine
+// breakage still fails with BOTH errors in the panic message.
+async fn launch_with_retry(
+    store: &BrowserStore,
+    params: impl Fn() -> BrowserLaunchParams,
+) -> Result<BrowserLaunchResult, BrowserError> {
+    match store.launch(params()).await {
+        Ok(res) => Ok(res),
+        Err(first) if matches!(&first, BrowserError::Cdp(_)) => {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            Ok(store
+                .launch(params())
+                .await
+                .unwrap_or_else(|second| panic!("launch (retried): first={first} second={second}")))
+        }
+        Err(other) => Err(other),
+    }
+}
 
 /// Local HTTP server serving `/fixture` (the given body JS) and `/dest`
 /// (the popup destination). Chrome blocks top-frame navigation to `data:`
@@ -251,14 +275,13 @@ async fn live_browser_dialogs_do_not_freeze_and_popups_stay_in_session() {
 
     // -- Scenario A: window.open through the guard → SAME tab navigation
     // over REAL http (data: top-frame navigation is blocked by Chrome).
-    let launch = store
-        .launch(BrowserLaunchParams {
-            url: Some(format!("{base}/fixture")),
-            headed: false,
-            size: None,
-        })
-        .await
-        .expect("launch should succeed with a real browser");
+    let launch = launch_with_retry(&store, || BrowserLaunchParams {
+        url: Some(format!("{base}/fixture")),
+        headed: false,
+        size: None,
+    })
+    .await
+    .expect("launch should succeed with a real browser");
     assert!(launch.launched);
     let snap_text = launch
         .snapshot
@@ -303,14 +326,13 @@ async fn live_browser_dialogs_do_not_freeze_and_popups_stay_in_session() {
     // -- Scenario B: alert() fires during load — the page must stay alive,
     // and SOME drained snapshot must carry what the page asked. The launch
     // snapshot may itself be the one that drains the ring, so it counts too.
-    let launch_b = store
-        .launch(BrowserLaunchParams {
-            url: Some(format!("{base}/fixture?dialog=1")),
-            headed: false,
-            size: None,
-        })
-        .await
-        .expect("relaunch replaces the previous session");
+    let launch_b = launch_with_retry(&store, || BrowserLaunchParams {
+        url: Some(format!("{base}/fixture?dialog=1")),
+        headed: false,
+        size: None,
+    })
+    .await
+    .expect("relaunch replaces the previous session");
 
     // The snapshot itself proves the page is not frozen (GetFullAxTree runs
     // in the page and would not answer while a dialog is open).
@@ -345,14 +367,13 @@ async fn live_browser_dialogs_do_not_freeze_and_popups_stay_in_session() {
     // -- Scenario C: plain <a target="_blank"> — anchor activation bypasses
     // window.open (proven live before the fix), so the guard also intercepts
     // the click in the capture phase and navigates the SAME tab.
-    let launch_c = store
-        .launch(BrowserLaunchParams {
-            url: Some(format!("{base}/fixture?anchor=1")),
-            headed: false,
-            size: None,
-        })
-        .await
-        .expect("relaunch for scenario C");
+    let launch_c = launch_with_retry(&store, || BrowserLaunchParams {
+        url: Some(format!("{base}/fixture?anchor=1")),
+        headed: false,
+        size: None,
+    })
+    .await
+    .expect("relaunch for scenario C");
     let anchor_ref = ref_for(
         &launch_c
             .snapshot
@@ -413,14 +434,13 @@ async fn live_browser_verbs_eval_network_and_history() {
     let (base, _addr) = spawn_fixture_server().await;
 
     // -- 1. Fine-grained verbs against the live page.
-    store
-        .launch(BrowserLaunchParams {
-            url: Some(format!("{base}/fixture?verbos=1")),
-            headed: false,
-            size: None,
-        })
-        .await
-        .expect("launch (verbs fixture)");
+    launch_with_retry(&store, || BrowserLaunchParams {
+        url: Some(format!("{base}/fixture?verbos=1")),
+        headed: false,
+        size: None,
+    })
+    .await
+    .expect("launch (verbs fixture)");
 
     let snap = store
         .snapshot(SnapshotParams { limit: None, focus: None, max_nodes: None })
@@ -682,10 +702,11 @@ async fn live_browser_multitab_select_and_close_last_teardown() {
     let store = BrowserStore::new();
     let (base, _addr) = spawn_fixture_server().await;
 
-    store
-        .launch(BrowserLaunchParams { url: Some(format!("{base}/fixture?tabs=1")), headed: false, size: None })
-        .await
-        .expect("launch (tabs fixture)");
+    launch_with_retry(&store, || {
+        BrowserLaunchParams { url: Some(format!("{base}/fixture?tabs=1")), headed: false, size: None }
+    })
+    .await
+    .expect("launch (tabs fixture)");
 
     // Open a second tab whose page announces its own tab id.
     let opened = store
@@ -735,10 +756,11 @@ async fn live_browser_route_mock_serves_locally_and_passes_through() {
     let store = BrowserStore::new();
     let (base, _addr) = spawn_fixture_server().await;
 
-    store
-        .launch(BrowserLaunchParams { url: Some(format!("{base}/fixture?mock=1")), headed: false, size: None })
-        .await
-        .expect("launch (mock fixture)");
+    launch_with_retry(&store, || {
+        BrowserLaunchParams { url: Some(format!("{base}/fixture?mock=1")), headed: false, size: None }
+    })
+    .await
+    .expect("launch (mock fixture)");
 
     // Rule 1: /api/mock-me → local 200 with fixed JSON.
     // Rule 2: /api/boom → local 500. Both WITHOUT touching the fixture server.
@@ -821,10 +843,11 @@ async fn live_browser_mock_survives_tab_open_then_top_frame_nav() {
     let store = BrowserStore::new();
     let (base, _addr) = spawn_fixture_server().await;
 
-    store
-        .launch(BrowserLaunchParams { url: Some(format!("{base}/fixture?mock=1")), headed: false, size: None })
-        .await
-        .expect("launch");
+    launch_with_retry(&store, || {
+        BrowserLaunchParams { url: Some(format!("{base}/fixture?mock=1")), headed: false, size: None }
+    })
+    .await
+    .expect("launch");
 
     // Same order as the failing E2E: new tab (rebinds session.page), THEN
     // arm the rules, THEN top-frame navigate the original tab.
@@ -884,14 +907,13 @@ async fn live_browser_semantic_actions_states_and_inline_shot() {
     let store = BrowserStore::new();
     let (base, _addr) = spawn_fixture_server().await;
 
-    let launch = store
-        .launch(BrowserLaunchParams {
-            url: Some(format!("{base}/fixture?form=1")),
-            headed: false,
-            size: None,
-        })
-        .await
-        .expect("launch for the semantic-actions suite");
+    let launch = launch_with_retry(&store, || BrowserLaunchParams {
+        url: Some(format!("{base}/fixture?form=1")),
+        headed: false,
+        size: None,
+    })
+    .await
+    .expect("launch for the semantic-actions suite");
     let snap = launch.snapshot.as_ref().expect("launch snapshot");
 
     // 1. States from properties[] (the old top-level read NEVER matched).
