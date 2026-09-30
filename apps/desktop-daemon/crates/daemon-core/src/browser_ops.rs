@@ -31,7 +31,7 @@ use tokio::sync::Mutex;
 use chromiumoxide::{
     browser::{Browser, BrowserConfig},
     cdp::browser_protocol::{
-        accessibility::{AxNode, AxPropertyName, AxProperty, AxValue, AxValueType, GetFullAxTreeParams},
+        accessibility::{AxNode, AxPropertyName, AxValue, GetFullAxTreeParams},
         dom::{BackendNodeId, FocusParams, GetContentQuadsParams, ScrollIntoViewIfNeededParams},
         input::{
             DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams,
@@ -2257,6 +2257,9 @@ mod browser_ops_defaults {
 mod tests {
     use super::*;
     use serde_json::json;
+    // Test-only CDP shapes (AxNode/AxValue builders).
+    #[cfg(feature = "browser")]
+    use chromiumoxide::cdp::browser_protocol::accessibility::{AxProperty, AxValueType};
 
     #[cfg(feature = "browser")]
     #[test]

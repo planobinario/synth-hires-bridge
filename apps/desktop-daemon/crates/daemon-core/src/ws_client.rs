@@ -54,6 +54,7 @@ impl ParkMarker for DaemonError {
 }
 impl ParkMarker for String {}
 impl ParkMarker for crate::browser_ops::BrowserError {}
+impl ParkMarker for crate::os_ax::OsError {}
 
 macro_rules! dispatch_op {
     ($self:ident, $ws:ident, $request:ident, $started:ident, $value:ident, $req:ident, $param_ty:ty, $run:block) => {{
@@ -121,6 +122,7 @@ pub struct WsClient {
     proc: Arc<crate::proc_ops::ProcEngine>,
     pty: Arc<crate::pty_ops::PtyEngine>,
     browser: Arc<crate::browser_ops::BrowserStore>,
+    os_ax: Arc<crate::os_ax::OsAxEngine>,
     dap: Arc<crate::dap_ops::DapEngine>,
     mcp: Arc<crate::mcp_ops::McpStore>,
     chat_store: Arc<ChatStore>,
@@ -174,6 +176,7 @@ impl WsClient {
             proc: Arc::new(crate::proc_ops::ProcEngine::new(gate.clone())),
             pty: Arc::new(crate::pty_ops::PtyEngine::new(gate.clone())),
             browser: Arc::new(crate::browser_ops::BrowserStore::new()),
+            os_ax: Arc::new(crate::os_ax::OsAxEngine::new()),
             dap: Arc::new(crate::dap_ops::DapEngine::new(gate.clone())),
             mcp: Arc::new(crate::mcp_ops::McpStore::new()),
             memory: Arc::new(
@@ -365,6 +368,7 @@ impl WsClient {
                 "proc".to_string(),
                 "pty".to_string(),
                 "browser".to_string(),
+                "os".to_string(),
                 "dap".to_string(),
                 "mcp".to_string(),
                 "tools".to_string(),
@@ -593,6 +597,11 @@ impl WsClient {
             "desktop.browser.tab_open" | "desktop.browser.tab_select" | "desktop.browser.tab_close"
             | "desktop.browser.mock_set" => "desktop.network.fetch",
             "desktop.browser.tab_list" => "desktop.fs.read",
+            // Native desktop computer use: reading any app's AX tree is a
+            // read; semantic actions (press/set_text/select) ride the same
+            // consent tier as browser.act / shell — they drive REAL apps.
+            "desktop.os.snapshot" | "desktop.os.apps" | "desktop.os.available" => "desktop.fs.read",
+            "desktop.os.act" => "desktop.shell.execute",
             // Debugger: start/eval/flow-control are as powerful as a shell;
             // inspection ops (breakpoints, stack, variables, threads) are reads.
             // MCP: status is a read; spawning/listing/calling a server is as
@@ -920,8 +929,7 @@ impl WsClient {
                 dispatch_op!(self, ws, request, started, value, req, crate::browser_ops::SnapshotParams, {
                     self.browser.snapshot(value).await
                 })
-            }
-            "desktop.browser.act" => {
+            }            "desktop.browser.act" => {
                 dispatch_op!(self, ws, request, started, value, req, crate::browser_ops::BrowserActParams, {
                     self.browser.act(value).await
                 })
@@ -954,6 +962,29 @@ impl WsClient {
             "desktop.browser.close" => {
                 dispatch_op!(self, ws, request, started, value, req, crate::browser_ops::BrowserCloseParams, {
                     self.browser.close(value.kill).await
+                })
+            }
+            // Native desktop computer use (feature `os`; honest stubs without).
+            "desktop.os.available" => {
+                dispatch_op!(self, ws, request, started, value, req, crate::os_ax::OsAvailableParams, {
+                    let _ = &value; // unit params: nothing to parse past serde
+                    self.os_ax.available().await
+                })
+            }
+            "desktop.os.apps" => {
+                dispatch_op!(self, ws, request, started, value, req, crate::os_ax::OsAppsParams, {
+                    let _ = &value;
+                    self.os_ax.apps().await
+                })
+            }
+            "desktop.os.snapshot" => {
+                dispatch_op!(self, ws, request, started, value, req, crate::os_ax::OsSnapshotParams, {
+                    self.os_ax.snapshot(value).await
+                })
+            }
+            "desktop.os.act" => {
+                dispatch_op!(self, ws, request, started, value, req, crate::os_ax::OsActParams, {
+                    self.os_ax.act(value).await
                 })
             }
             "desktop.browser.tab_open" => {

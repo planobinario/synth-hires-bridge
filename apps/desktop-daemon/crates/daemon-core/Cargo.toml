@@ -36,10 +36,19 @@ ast-grep-language = "0.45.3"
 portable-pty = "0.9.0"
 chromiumoxide = { version = "0.9.1", optional = true }
 base64 = { version = "0.22", optional = true }
+# Native desktop accessibility (computer use over the OS AX tree).
+# Linux: atspi/zbus (pure Rust). macOS: `accessibility` crate (slot).
+# Windows: `uiautomation` crate (slot). See os_ax.rs.
+[target.'cfg(target_os = "linux")'.dependencies]
+atspi = { version = "0.30", default-features = false, features = ["connection", "proxies", "tokio"], optional = true }
+zbus = { version = "5", default-features = false, features = ["tokio"], optional = true }
 
 [features]
 # CDP browser automation (chromiumoxide). Off by default; daemon-cli enables it.
 browser = ["dep:chromiumoxide", "dep:base64"]
+# Native desktop accessibility (real computer use: any app's AX tree +
+# native actions). Linux-only today; macOS/Windows backends pending.
+os = ["dep:atspi", "dep:zbus"]
 
 [lib]
 name = "daemon_core"

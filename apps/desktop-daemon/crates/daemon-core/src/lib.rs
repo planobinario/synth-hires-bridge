@@ -29,6 +29,9 @@ pub mod lsp_ops;
 pub mod mcp_ops;
 pub mod memory_store;
 pub mod keyring;
+// Native desktop accessibility (computer use tier): Linux AT-SPI behind the
+// `os` feature, API-preserving stubs without it.
+pub mod os_ax;
 pub mod os_info;
 pub mod pairing;
 pub mod proc_ops;
