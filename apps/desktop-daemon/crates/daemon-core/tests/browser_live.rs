@@ -60,6 +60,29 @@ async fn spawn_fixture_server() -> (String, std::net::SocketAddr) {
                         None,
                         String::new(),
                     )
+                } else if path.contains("form=1") {
+                    (
+                        "sh-e2e-fixture".into(),
+                        String::new(),
+                        Some(String::from(
+                            "<label>Full name <input id=\"full-name\"></label>\
+                             <label>Newsletter <input id=\"newsletter\" type=\"checkbox\" disabled></label>\
+                             <label for=\"lang\">Lang</label>\
+                             <select id=\"lang\"><option value=\"\">--</option>\
+                             <option value=\"rust\">Rust</option><option value=\"go\">Go</option></select>",
+                        )),
+                        String::from(
+                            r#"
+                  window.__name_change = 0; window.__sel_change = 0; window.__sel_val = '';
+                  const inp = document.getElementById('full-name');
+                  inp.addEventListener('input', () => { window.__name_change++; });
+                  inp.addEventListener('change', () => { window.__name_change++; });
+                  const sel = document.getElementById('lang');
+                  sel.addEventListener('input', () => { window.__sel_change++; });
+                  sel.addEventListener('change', () => { window.__sel_change++; window.__sel_val = sel.value; });
+                  "#,
+                        ),
+                    )
                 } else if path.contains("verbos=1") {
                     (
                         "sh-e2e-fixture".into(),
@@ -197,6 +220,26 @@ fn ref_for(text: &str, needle: &str) -> Option<i64> {
     None
 }
 
+/// Like `ref_for`, but also requires the AX role on the line — "Full name"
+/// matches BOTH the <label> and the <input>'s accessible name; only the
+/// textbox line carries the actionable ref.
+fn ref_for_role(text: &str, role: &str, needle: &str) -> Option<i64> {
+    for line in text.lines() {
+        if !line.contains(&format!("{role} ")) || !line.contains(needle) {
+            continue;
+        }
+        let start = line.find("[ref=")? + 5;
+        let digits: String = line[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(n) = digits.parse::<i64>() {
+            return Some(n);
+        }
+    }
+    None
+}
+
 #[tokio::test]
 async fn live_browser_dialogs_do_not_freeze_and_popups_stay_in_session() {
     if !chrome_available() {
@@ -233,6 +276,8 @@ async fn live_browser_dialogs_do_not_freeze_and_popups_stay_in_session() {
             modifiers: None,
             button: None,
             click_count: None,
+            value: None,
+            screenshot: None,
         })
         .await
         .expect("click by snapshot ref should work");
@@ -326,6 +371,8 @@ async fn live_browser_dialogs_do_not_freeze_and_popups_stay_in_session() {
             modifiers: None,
             button: None,
             click_count: None,
+            value: None,
+            screenshot: None,
         })
         .await
         .expect("anchor click dispatches");
@@ -386,6 +433,8 @@ async fn live_browser_verbs_eval_network_and_history() {
         .act(BrowserActParams {
             element_ref: hover_ref, action: "hover".into(), text: None,
             modifiers: None, button: None, click_count: None,
+            value: None,
+            screenshot: None,
         })
         .await
         .expect("hover dispatches");
@@ -395,6 +444,8 @@ async fn live_browser_verbs_eval_network_and_history() {
         .act(BrowserActParams {
             element_ref: 0, action: "press".into(), text: Some("Tab".into()),
             modifiers: Some(vec!["shift".into()]), button: None, click_count: None,
+            value: None,
+            screenshot: None,
         })
         .await
         .expect("shift+Tab dispatches");
@@ -404,6 +455,8 @@ async fn live_browser_verbs_eval_network_and_history() {
         .act(BrowserActParams {
             element_ref: hover_ref, action: "click".into(), text: None,
             modifiers: None, button: None, click_count: Some(2),
+            value: None,
+            screenshot: None,
         })
         .await
         .expect("double click dispatches");
@@ -411,6 +464,8 @@ async fn live_browser_verbs_eval_network_and_history() {
         .act(BrowserActParams {
             element_ref: hover_ref, action: "click".into(), text: None,
             modifiers: None, button: Some("right".into()), click_count: None,
+            value: None,
+            screenshot: None,
         }
         )
         .await
@@ -501,6 +556,8 @@ async fn live_browser_verbs_eval_network_and_history() {
         .act(BrowserActParams {
             element_ref: 0, action: "back".into(), text: None,
             modifiers: None, button: None, click_count: None,
+            value: None,
+            screenshot: None,
         })
         .await
         .expect("back dispatches");
@@ -517,6 +574,8 @@ async fn live_browser_verbs_eval_network_and_history() {
         .act(BrowserActParams {
             element_ref: 0, action: "forward".into(), text: None,
             modifiers: None, button: None, click_count: None,
+            value: None,
+            screenshot: None,
         })
         .await
         .expect("forward dispatches");
@@ -533,6 +592,8 @@ async fn live_browser_verbs_eval_network_and_history() {
         .act(BrowserActParams {
             element_ref: 0, action: "reload".into(), text: None,
             modifiers: None, button: None, click_count: None,
+            value: None,
+            screenshot: None,
         })
         .await
         .expect("reload dispatches");
@@ -805,4 +866,171 @@ async fn live_browser_mock_survives_tab_open_then_top_frame_nav() {
         body.contains("top-frame"),
         "top-frame nav must be served by the route mock after tab_open+arm; got: {body}"
     );
+}
+
+/// Semantic setters + states + hybrid capture — the Codex-style slice.
+/// Proves on REAL Chrome: (1) states render from properties[] ([disabled],
+/// [unchecked]); (2) set_value writes through the native setter firing
+/// input+change EXACTLY once (no keystorm — a type-storm would hit 13);
+/// (3) select picks by label with a native change event and a miss lists
+/// the options; (4) set_value on a <select> picks by value; (5) an act can
+/// return its verification screenshot inline in the SAME response.
+#[tokio::test]
+async fn live_browser_semantic_actions_states_and_inline_shot() {
+    if !chrome_available() {
+        eprintln!("browser e2e: skipped — no Chrome/Chromium/Edge binary available");
+        return;
+    }
+    let store = BrowserStore::new();
+    let (base, _addr) = spawn_fixture_server().await;
+
+    let launch = store
+        .launch(BrowserLaunchParams {
+            url: Some(format!("{base}/fixture?form=1")),
+            headed: false,
+            size: None,
+        })
+        .await
+        .expect("launch for the semantic-actions suite");
+    let snap = launch.snapshot.as_ref().expect("launch snapshot");
+
+    // 1. States from properties[] (the old top-level read NEVER matched).
+    assert!(
+        snap.text.contains("[disabled]"),
+        "disabled checkbox must render [disabled]; got:\n{}",
+        snap.text
+    );
+    assert!(
+        snap.text.contains("[unchecked]"),
+        "unchecked checkbox must render [unchecked]; got:\n{}",
+        snap.text
+    );
+
+    // 2. set_value: native setter + input/change — the counter rises by 2
+    // (both events, once), not by 13 (per-character keystorm). Ref by ROLE:
+    // the guard must (and does) reject non-assignable nodes like the label.
+    let name_ref = ref_for_role(&snap.text, "textbox", "Full name").expect("textbox ref");
+    let out = store
+        .act(BrowserActParams {
+            element_ref: name_ref,
+            action: "set_value".into(),
+            text: None,
+            value: Some("Ada Lovelace".into()),
+            modifiers: None,
+            button: None,
+            click_count: None,
+            screenshot: None,
+        })
+        .await
+        .expect("set_value works");
+    assert!(
+        out.snapshot.text.contains("= Ada Lovelace"),
+        "verification snapshot must show the new value; got:\n{}",
+        out.snapshot.text
+    );
+    let seen = store
+        .eval(BrowserEvalParams {
+            expression: "window.__name_change".into(),
+        })
+        .await
+        .expect("eval counter");
+    assert_eq!(
+        seen.value.as_i64(),
+        Some(2),
+        "native setter fires input+change exactly once each (2), never a per-char storm"
+    );
+
+    // 3. select by LABEL with native change. Refs come from the LATEST
+    // snapshot (each act rebuilds the map from its verification tree).
+    let lang_ref = ref_for_role(&out.snapshot.text, "combobox", "Lang").expect("combobox ref");
+    store
+        .act(BrowserActParams {
+            element_ref: lang_ref,
+            action: "select".into(),
+            text: Some("Rust".into()),
+            value: None,
+            modifiers: None,
+            button: None,
+            click_count: None,
+            screenshot: None,
+        })
+        .await
+        .expect("select works");
+    let seen_sel = store
+        .eval(BrowserEvalParams {
+            expression: "window.__sel_change + '_' + window.__sel_val".into(),
+        })
+        .await
+        .expect("eval select counters");
+    assert_eq!(
+        seen_sel.value.as_str(),
+        Some("2_rust"),
+        "select must fire input+change once and land on the rust option"
+    );
+
+    // A miss is an ACTIONABLE error: the available options come back.
+    let err = store
+        .act(BrowserActParams {
+            element_ref: lang_ref,
+            action: "select".into(),
+            text: Some("Cobol".into()),
+            value: None,
+            modifiers: None,
+            button: None,
+            click_count: None,
+            screenshot: None,
+        })
+        .await
+        .expect_err("unknown option must error");
+    assert!(
+        err.to_string().contains("Rust | Go"),
+        "the error must list the available options; got: {err}"
+    );
+
+    // 4. set_value on the <select> doubles as the by-VALUE pick.
+    store
+        .act(BrowserActParams {
+            element_ref: lang_ref,
+            action: "set_value".into(),
+            text: None,
+            value: Some("go".into()),
+            modifiers: None,
+            button: None,
+            click_count: None,
+            screenshot: None,
+        })
+        .await
+        .expect("set_value on select picks by value");
+    let sel_val = store
+        .eval(BrowserEvalParams {
+            expression: "window.__sel_val".into(),
+        })
+        .await
+        .expect("eval select value");
+    assert_eq!(sel_val.value.as_str(), Some("go"));
+
+    // 5. Hybrid perception: the verification screenshot rides in the SAME
+    // act response (jpeg default — 5-10x lighter than png).
+    let with_shot = store
+        .act(BrowserActParams {
+            element_ref: name_ref,
+            action: "set_value".into(),
+            text: None,
+            value: Some("Grace Hopper".into()),
+            modifiers: None,
+            button: None,
+            click_count: None,
+            screenshot: Some("jpeg".into()),
+        })
+        .await
+        .expect("act with inline shot");
+    let shot = with_shot.screenshot.expect("inline screenshot present");
+    assert_eq!(shot.format, "jpeg");
+    assert!(
+        shot.base64.len() > 1_000,
+        "a real viewport capture, not a stub (len={})",
+        shot.base64.len()
+    );
+
+    store.close(true).await.expect("close");
 }

@@ -3,9 +3,12 @@
 //! Uses `chromiumoxide` (Puppeteer-in-Rust over the Chrome DevTools Protocol).
 //! The model gets what "blind" vibecoding lacks: launch (headless by default),
 //! navigate, a compact accessibility-tree snapshot with stable per-node refs,
-//! click/type/press/scroll **by ref**, and PNG screenshots as base64 (like
-//! `fs.read` images). Console + page errors are captured so the agent can see
-//! what the page *said*.
+//! click/type/press/scroll **by ref**, semantic setters (`set_value`,
+//! `select` — the CDP equivalent of native AXPress/setValue: one round-trip,
+//! native events, no keystorm, no pixel coordinates), optional inline
+//! verification screenshot on every act (hybrid perception), and PNG/JPEG
+//! screenshots as base64 (like `fs.read` images). Console + page errors are
+//! captured so the agent can see what the page *said*.
 //!
 //! House patterns honored:
 //! - One session per workspace root (`browser.launch` is idempotent).
@@ -28,7 +31,7 @@ use tokio::sync::Mutex;
 use chromiumoxide::{
     browser::{Browser, BrowserConfig},
     cdp::browser_protocol::{
-        accessibility::GetFullAxTreeParams,
+        accessibility::{AxNode, AxPropertyName, AxProperty, AxValue, AxValueType, GetFullAxTreeParams},
         dom::{BackendNodeId, FocusParams, GetContentQuadsParams, ScrollIntoViewIfNeededParams},
         input::{
             DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams,
@@ -134,7 +137,9 @@ pub struct BrowserNavigateResult {
 
 #[derive(Debug, Deserialize)]
 pub struct SnapshotParams {
-    /// Max nodes in the snapshot (safety cap). Default 350.
+    /// Max RENDERED nodes in the snapshot (safety cap). Default 350. The
+    /// full tree always arrives from CDP (focused polling, wait conditions
+    /// and refs never truncate) — this bounds only the agent-facing text.
     #[serde(default)]
     pub limit: Option<usize>,
     /// Narrow-down: start the window at the node whose name/value contains
@@ -205,6 +210,14 @@ pub struct BrowserActParams {
     /// Click count: 1 (default) or 2 for double-click.
     #[serde(default)]
     pub click_count: Option<i32>,
+    /// `set_value`: full replacement text for the element (the CDP equivalent
+    /// of the native AX `setValue` — one round-trip, no keystorm).
+    #[serde(default)]
+    pub value: Option<String>,
+    /// Inline verification capture in the SAME response (hybrid perception:
+    /// semantic tree + pixels together). "jpeg" (default) | "png".
+    #[serde(default)]
+    pub screenshot: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -212,6 +225,10 @@ pub struct BrowserActResult {
     pub ok: bool,
     /// Fresh snapshot after the action (verify-your-work loop).
     pub snapshot: SnapshotResult,
+    /// Present when the request asked for `screenshot`: the inline capture
+    /// (hybrid perception without a second round-trip).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot: Option<ScreenshotResult>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -873,11 +890,11 @@ impl BrowserStore {
             ring.drain(..).collect()
         };
 
-        // Serialize nodes to JSON once — extraction becomes shape-safe.
-        let mut serialized: Vec<Value> = nodes
-            .iter()
-            .filter_map(|node| serde_json::to_value(node).ok())
-            .collect();
+        // TYPED pipeline (no per-node JSON): the typed AxNode is read
+        // directly. The old path serde-serialized every node to a Value and
+        // pointer-walked strings per field — the single largest CPU+alloc
+        // cost of every snapshot.
+        let mut serialized: Vec<&AxNode> = nodes.iter().collect();
 
         // Narrow-down: slice the tree so the agent can iterate over sections
         // instead of paying for the whole page (the OMP "iterate narrow-down"
@@ -886,16 +903,12 @@ impl BrowserStore {
         if let Some(needle) = focus.map(|f| f.trim()).filter(|f| !f.is_empty()) {
             let lower = needle.to_lowercase();
             let hit = serialized.iter().position(|v| {
-                if v.get("ignored").and_then(Value::as_bool).unwrap_or(false) {
+                if v.ignored {
                     return false;
                 }
-                for key in ["name", "value"] {
-                    if let Some(s) = v
-                        .pointer(&format!("/{key}/value"))
-                        .and_then(Value::as_str)
-                        .map(|s| s.to_lowercase())
-                    {
-                        if s.contains(&lower) {
+                for ax in [&v.name, &v.value] {
+                    if let Some(s) = ax.as_ref().and_then(ax_value_text) {
+                        if s.to_lowercase().contains(&lower) {
                             return true;
                         }
                     }
@@ -914,11 +927,11 @@ impl BrowserStore {
 
         // Hierarchy pass: one O(n) sweep builds the parent maps, then a
         // memoized climb yields the TRUE tree depth per node (real indent,
-        // not the old flat one-level heuristic).
+        // not the old flat one-level heuristic). Keys are borrowed &str —
+        // the old version allocated a String per node id.
         let (by_id, by_child) = ax_parent_maps(&serialized);
-        let mut depth_cache: std::collections::HashMap<String, usize> =
+        let mut depth_cache: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
-        let mut depth_of = |id: &str| ax_depth(id, &by_id, &by_child, &mut depth_cache);
 
         let mut refs = HashMap::new();
         let mut out = String::new();
@@ -928,37 +941,26 @@ impl BrowserStore {
             if count >= limit {
                 break;
             }
-            let ignored = v.get("ignored").and_then(Value::as_bool).unwrap_or(false);
-            if ignored {
+            if v.ignored {
                 continue;
             }
-            let role = v
-                .pointer("/role/value")
-                .and_then(Value::as_str)
-                .unwrap_or("generic")
-                .to_string();
-            let name = ax_text(v.pointer("/name"));
-            let value = ax_text(v.pointer("/value"));
-            let node_id = v
-                .get("nodeId")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let backend = v
-                .get("backendDOMNodeId")
-                .and_then(Value::as_i64)
+            let role = v.role.as_ref().and_then(ax_value_text).unwrap_or("generic");
+            let name = v.name.as_ref().and_then(ax_value_text).unwrap_or_default();
+            let value = v
+                .value
+                .as_ref()
+                .and_then(ax_value_text)
+                .unwrap_or_default();
+            let node_id = v.node_id.as_ref();
+            let backend: i64 = v
+                .backend_dom_node_id
+                .as_ref()
+                .map(|b| *b.inner())
                 .unwrap_or(0);
 
             // Only interesting nodes get refs (interactive or with content).
-            let interesting = matches!(
-                role.as_str(),
-                "link" | "button" | "textbox" | "searchbox" | "combobox" | "checkbox"
-                    | "radio" | "menuitem" | "tab" | "option" | "slider" | "switch"
-                    | "listbox" | "menu" | "tablist" | "heading" | "img" | "article"
-                    | "navigation" | "main" | "dialog" | "alert" | "status"
-                    | "progressbar" | "spinbutton" | "textarea" | "list" | "tree"
-            ) || !name.is_empty()
-                || !value.is_empty();
+            let interesting =
+                INTERESTING_ROLES.contains(&role) || !name.is_empty() || !value.is_empty();
 
             if !interesting {
                 continue;
@@ -970,23 +972,28 @@ impl BrowserStore {
                 refs.insert(r, backend);
             }
 
-            let indent = "  ".repeat(depth_of(&node_id));
+            let indent = "  ".repeat(ax_depth(node_id, &by_id, &by_child, &mut depth_cache));
             let mut line = format!("{indent}[ref={r}] {role}");
             if !name.is_empty() {
-                line.push_str(&format!(" \"{name}\""));
+                line.push_str(&format!(" \"{}\"", cap_text(&name, MAX_NAME_CHARS)));
             }
             if !value.is_empty() && value != name {
-                line.push_str(&format!(" = {value}"));
+                line.push_str(&format!(" = {}", cap_text(&value, MAX_VALUE_CHARS)));
             }
-            if let Some(b) = v.get("disabled").and_then(Value::as_bool) {
-                if b {
-                    line.push_str(" (disabled)");
-                }
+            // States come from properties[] (the old top-level read never
+            // matched CDP's shape — states were silently never rendered).
+            let (disabled, focused, checked, expanded) = ax_node_states(v);
+            if disabled {
+                line.push_str(" [disabled]");
             }
-            if let Some(b) = v.get("focused").and_then(Value::as_bool) {
-                if b {
-                    line.push_str(" (focused)");
-                }
+            if focused {
+                line.push_str(" [focused]");
+            }
+            if let Some(c) = checked {
+                line.push_str(&format!(" [{c}]"));
+            }
+            if let Some(e) = expanded {
+                line.push_str(&format!(" [{e}]"));
             }
             out.push_str(&line);
             out.push('\n');
@@ -1052,13 +1059,249 @@ impl BrowserStore {
             "reload" => {
                 self.act_reload_with_session(session).await?;
             }
+            "set_value" => {
+                let text = p
+                    .value
+                    .clone()
+                    .or_else(|| p.text.clone())
+                    .ok_or_else(|| {
+                        BrowserError::Cdp("set_value: missing `value` (replacement text)".into())
+                    })?;
+                self.act_set_value(session, p.element_ref, &text).await?;
+            }
+            "select" => {
+                let label = p
+                    .text
+                    .clone()
+                    .or_else(|| p.value.clone())
+                    .ok_or_else(|| {
+                        BrowserError::Cdp("select: missing `text` (option label to pick)".into())
+                    })?;
+                self.act_select(session, p.element_ref, &label).await?;
+            }
             other => return Err(BrowserError::BadAction(other.to_string())),
         }
 
         // Small settle delay, then a fresh snapshot to verify.
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
         let snapshot = self.snapshot_inner(session, 350, None, None).await?;
-        Ok(BrowserActResult { ok: true, snapshot })
+        // Hybrid perception: optionally attach the verification capture to
+        // the SAME response (jpeg by default — 5-10x lighter than PNG).
+        // Calls the LOCK-FREE inner helper: `self.screenshot` would re-lock
+        // `sessions` (already held by `act`) and deadlock the runtime —
+        // caught by the live E2E hanging the whole suite.
+        let screenshot = match p.screenshot.as_deref() {
+            None => None,
+            Some(fmt) => Some(
+                Self::screenshot_inner(
+                    session,
+                    &ScreenshotParams {
+                        format: Some(fmt.to_string()),
+                        quality: Some(70),
+                        full_page: Some(false),
+                    },
+                )
+                .await?,
+            ),
+        };
+        Ok(BrowserActResult {
+            ok: true,
+            snapshot,
+            screenshot,
+        })
+    }
+
+    /// DOM `set value` — the semantic setter. Resolves the backend node and
+    /// runs a focused setter that picks the right pathway per element kind
+    /// (native setter + input/change events for inputs, userGesture-enabled
+    /// select for <select>). One round-trip, no keystorm, no coords.
+    async fn act_set_value(
+        &self,
+        session: &mut BrowserSession,
+        r: i64,
+        text: &str,
+    ) -> Result<(), BrowserError> {
+        use chromiumoxide::cdp::browser_protocol::dom::ResolveNodeParams;
+        use chromiumoxide::cdp::js_protocol::runtime::{
+            CallArgument, CallFunctionOnParams, RemoteObjectId,
+        };
+        let backend = *session.refs.get(&r).ok_or(BrowserError::UnknownRef(r))?;
+        let resolved = session
+            .page
+            .execute(
+                ResolveNodeParams::builder()
+                    .backend_node_id(BackendNodeId::new(backend))
+                    .build(),
+            )
+            .await
+            .map_err(|e| BrowserError::Cdp(format!("resolve node: {e}")))?;
+        let Some(object_id) = resolved.result.object.object_id else {
+            return Err(BrowserError::Cdp(
+                "set_value: element has no JS handle (detached or display:none)".into(),
+            ));
+        };
+        let setter = r#"function(newValue) {
+  const tag = this.tagName;
+  if (tag === 'TEXTAREA' || (tag === 'INPUT' &&
+      (!this.type || !['checkbox','radio','button','submit','file'].includes(this.type.toLowerCase())))) {
+    const proto = tag === 'TEXTAREA'
+      ? window.HTMLTextAreaElement.prototype
+      : window.HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    setter.call(this, newValue);
+    this.dispatchEvent(new Event('input', { bubbles: true }));
+    this.dispatchEvent(new Event('change', { bubbles: true }));
+    return 'set';
+  }
+  if (tag === 'SELECT') {
+    let hit = false;
+    for (const opt of this.options) {
+      if (opt.value === newValue || opt.text === newValue) {
+        if (this.selectedIndex !== opt.index) {
+          this.selectedIndex = opt.index;
+          this.dispatchEvent(new Event('input', { bubbles: true }));
+          this.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        hit = true;
+        break;
+      }
+    }
+    return hit ? 'set' : 'option-not-found';
+  }
+  if (this.isContentEditable) {
+    this.focus();
+    document.execCommand('selectAll', false, null);
+    document.execCommand('insertText', false, newValue);
+    this.dispatchEvent(new Event('input', { bubbles: true }));
+    return 'set';
+  }
+  return 'unsupported';
+}"#;
+        let call = session
+            .page
+            .execute(
+                CallFunctionOnParams::builder()
+                    .function_declaration(setter)
+                    .object_id(RemoteObjectId::new(object_id.inner().to_string()))
+                    .argument(CallArgument::builder().value(text).build())
+                    .return_by_value(true)
+                    .user_gesture(true)
+                    .build()
+                    .map_err(|e| BrowserError::Cdp(format!("set_value params: {e}")))?,
+            )
+            .await
+            .map_err(|e| BrowserError::Cdp(format!("set_value call: {e}")))?;
+        if let Some(exc) = call.result.exception_details {
+            return Err(BrowserError::Cdp(format!("set_value: {}", exc.text)));
+        }
+        match call.result.result.value.as_ref().and_then(Value::as_str) {
+            Some("set") => Ok(()),
+            Some("option-not-found") => Err(BrowserError::Cdp(
+                "set_value: no <option> matches that value/label".into(),
+            )),
+            Some("unsupported") => Err(BrowserError::Cdp(
+                "set_value: element does not accept value assignment (use click+type)".into(),
+            )),
+            other => Err(BrowserError::Cdp(format!("set_value: unexpected {other:?}"))),
+        }
+    }
+
+    /// `<select>` by option label (or value) — the semantic dropdown pick.
+    /// Same mechanism as `set_value` (native selectedIndex + change event),
+    /// with a friendlier error that LISTS the available options on a miss —
+    /// the model can self-correct without another round-trip.
+    async fn act_select(
+        &self,
+        session: &mut BrowserSession,
+        r: i64,
+        label: &str,
+    ) -> Result<(), BrowserError> {
+        use chromiumoxide::cdp::browser_protocol::dom::ResolveNodeParams;
+        use chromiumoxide::cdp::js_protocol::runtime::{
+            CallArgument, CallFunctionOnParams, RemoteObjectId,
+        };
+        let backend = *session.refs.get(&r).ok_or(BrowserError::UnknownRef(r))?;
+        let resolved = session
+            .page
+            .execute(
+                ResolveNodeParams::builder()
+                    .backend_node_id(BackendNodeId::new(backend))
+                    .build(),
+            )
+            .await
+            .map_err(|e| BrowserError::Cdp(format!("resolve node: {e}")))?;
+        let Some(object_id) = resolved.result.object.object_id else {
+            return Err(BrowserError::Cdp(
+                "select: element has no JS handle (detached or display:none)".into(),
+            ));
+        };
+        let picker = r#"function(label) {
+  if (this.tagName !== 'SELECT') return 'not-select';
+  let hit = false;
+  for (const opt of this.options) {
+    if (opt.text === label || opt.value === label) {
+      if (this.selectedIndex !== opt.index) {
+        this.selectedIndex = opt.index;
+        this.dispatchEvent(new Event('input', { bubbles: true }));
+        this.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      hit = true;
+      break;
+    }
+  }
+  return hit ? 'selected' : Array.from(this.options).map(o => o.text).join(' | ');
+}"#;
+        let call = session
+            .page
+            .execute(
+                CallFunctionOnParams::builder()
+                    .function_declaration(picker)
+                    .object_id(RemoteObjectId::new(object_id.inner().to_string()))
+                    .argument(CallArgument::builder().value(label).build())
+                    .return_by_value(true)
+                    .user_gesture(true)
+                    .build()
+                    .map_err(|e| BrowserError::Cdp(format!("select params: {e}")))?,
+            )
+            .await
+            .map_err(|e| BrowserError::Cdp(format!("select call: {e}")))?;
+        if let Some(exc) = call.result.exception_details {
+            return Err(BrowserError::Cdp(format!("select: {}", exc.text)));
+        }
+        match call.result.result.value.as_ref().and_then(Value::as_str) {
+            Some("selected") => Ok(()),
+            Some("not-select") => Err(BrowserError::Cdp(
+                "select: element is not a <select> (is it a listbox/combobox? use click)".into(),
+            )),
+            Some(options) if options.contains('|') => Err(BrowserError::Cdp(format!(
+                "select: no option matches {label:?}. Available: {options}"
+            ))),
+            other => Err(BrowserError::Cdp(format!("select: unexpected {other:?}"))),
+        }
+    }
+
+    /// Stable capture geometry: CDP screenshots scale with the DPR, so a
+    /// hidpi host inflates every capture. Pin the device metrics to scale=1
+    /// for the shot (ax-tree/layout untouched) and ALWAYS restore — even on
+    /// the error path (leaked overrides would wedge the page's viewport).
+    async fn set_device_metrics_override(
+        session: &chromiumoxide::Page,
+        width: u32,
+        height: u32,
+    ) -> Result<(), BrowserError> {
+        use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
+        let params = SetDeviceMetricsOverrideParams::builder()
+            .width(width as i64)
+            .height(height as i64)
+            .device_scale_factor(1.0)
+            .mobile(false)
+            .build()
+            .map_err(|e| BrowserError::Cdp(format!("metrics params: {e}")))?;
+        session
+            .execute(params)
+            .await
+            .map_err(|e| BrowserError::Cdp(format!("metrics override: {e}")))?;
+        Ok(())
     }
 
     async fn act_click(
@@ -1282,8 +1525,15 @@ impl BrowserStore {
     pub async fn screenshot(&self, p: ScreenshotParams) -> Result<ScreenshotResult, BrowserError> {
         let sessions = self.sessions.lock().await;
         let session = sessions.get(Self::SESSION).ok_or(BrowserError::NoSession)?;
+        Self::screenshot_inner(session, &p).await
+    }
 
-        let jpeg = p.format.as_deref() == Some("jpeg");
+    /// Lock-free capture (callers that already hold the sessions lock).
+    async fn screenshot_inner(
+        session: &BrowserSession,
+        p: &ScreenshotParams,
+    ) -> Result<ScreenshotResult, BrowserError> {
+        let jpeg = p.format.as_deref() != Some("png");
         let mut b = chromiumoxide::page::ScreenshotParams::builder()
             .format(if jpeg {
                 CaptureScreenshotFormat::Jpeg
@@ -1294,11 +1544,19 @@ impl BrowserStore {
         if jpeg {
             b = b.quality(p.quality.unwrap_or(80));
         }
-        let bytes = session
-            .page
-            .screenshot(b.build())
-            .await
-            .map_err(|e| BrowserError::Cdp(format!("screenshot: {e}")))?;
+        // DPR-1 pinning ONLY when not full-page: captureBeyondViewport and
+        // the metrics override interact badly (partial captures). The agent
+        // is geometry-agnostic (refs), so pixels just need to be stable.
+        let pinned = !p.full_page.unwrap_or(false);
+        if pinned {
+            Self::set_device_metrics_override(&session.page, 1280, 1280).await?;
+        }
+        let shot = session.page.screenshot(b.build()).await;
+        if pinned {
+            use chromiumoxide::cdp::browser_protocol::emulation::ClearDeviceMetricsOverrideParams;
+            let _ = session.page.execute(ClearDeviceMetricsOverrideParams::default()).await;
+        }
+        let bytes = shot.map_err(|e| BrowserError::Cdp(format!("screenshot: {e}")))?;
 
         Ok(ScreenshotResult {
             base64: base64_encode(&bytes),
@@ -1692,46 +1950,100 @@ fn dialog_console_line(kind: &str, message: &str, url: &str) -> ConsoleLine {
 // Helpers (pure — unit-tested without a browser)
 // ---------------------------------------------------------------------------
 
-/// Extract readable text from an AxValue JSON (`{type, value}`).
-#[cfg_attr(not(feature = "browser"), allow(dead_code))]
-fn ax_text(v: Option<&Value>) -> String {
-    let v = match v {
-        Some(v) => v,
-        None => return String::new(),
-    };
-    match v.get("value") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Number(n)) => n.to_string(),
-        Some(Value::Bool(b)) => b.to_string(),
-        _ => String::new(),
+/// Density caps for the textual state: an unbounded AX value (a whole
+/// JSON blob inside a textbox, a minified bundle in a code editor) is
+/// token poison — the model pays for it every turn it keeps the snapshot.
+#[cfg(feature = "browser")]
+const MAX_NAME_CHARS: usize = 120;
+#[cfg(feature = "browser")]
+const MAX_VALUE_CHARS: usize = 200;
+
+/// Roles that always earn a line in the agent-facing snapshot (plus any
+/// node carrying a non-empty name/value).
+#[cfg(feature = "browser")]
+const INTERESTING_ROLES: &[&str] = &[
+    "link", "button", "textbox", "searchbox", "combobox", "checkbox", "radio", "menuitem", "tab",
+    "option", "slider", "switch", "listbox", "menu", "tablist", "heading", "img", "article",
+    "navigation", "main", "dialog", "alert", "status", "progressbar", "spinbutton", "textarea",
+    "list", "tree",
+];
+
+/// Hard cap for one rendered string, with an honest ellipsis marker.
+#[cfg(feature = "browser")]
+fn cap_text(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if s.chars().count() <= max {
+        return std::borrow::Cow::Borrowed(s);
     }
+    let cut: usize = s.chars().take(max).map(char::len_utf8).sum();
+    std::borrow::Cow::Owned(format!("{}…", &s[..cut]))
+}
+
+/// Readable text from a typed `AxValue`: CDP stores the display string in
+/// `value` for string/computedString/token types (numbers/bools too), with
+/// `type` repeating the category. Empty string when absent.
+#[cfg(feature = "browser")]
+fn ax_value_text(v: &AxValue) -> Option<&str> {
+    v.value.as_ref().and_then(Value::as_str)
+}
+
+/// The states that matter to an acting agent, pulled from the node's
+/// `properties[]` list (CDP never puts them at the top level). Returns
+/// `(disabled, focused, checked, expanded)`; checked/expanded render only
+/// when the page actually reports them.
+#[cfg(feature = "browser")]
+fn ax_node_states(node: &AxNode) -> (bool, bool, Option<&'static str>, Option<&'static str>) {
+    let mut disabled = false;
+    let mut focused = false;
+    let mut checked: Option<&'static str> = None;
+    let mut expanded: Option<&'static str> = None;
+    for p in node.properties.as_deref().unwrap_or(&[]) {
+        let truth = p.value.value.as_ref().and_then(Value::as_bool);
+        match p.name {
+            AxPropertyName::Disabled => disabled = truth.unwrap_or(false),
+            AxPropertyName::Focused => focused = truth.unwrap_or(false),
+            AxPropertyName::Checked => {
+                checked = match p.value.value.as_ref().and_then(Value::as_str) {
+                    Some("true") => Some("checked"),
+                    Some("mixed") => Some("mixed"),
+                    _ => Some("unchecked"),
+                };
+            }
+            AxPropertyName::Expanded => {
+                expanded = match truth {
+                    Some(true) => Some("expanded"),
+                    Some(false) => Some("collapsed"),
+                    None => None,
+                };
+            }
+            _ => {}
+        }
+    }
+    (disabled, focused, checked, expanded)
 }
 
 /// Parent maps for one AX tree: node-id → parent-id (from `parentId`) and
 /// child-id → parent-id (reverse of `childIds`). Two maps because CDP omits
 /// `parentId` on some nodes that still appear in a parent's `childIds`.
-/// (`std::collections::HashMap` spelled out: the import is feature-gated.)
-#[cfg_attr(not(feature = "browser"), allow(dead_code))]
-fn ax_parent_maps(
-    nodes: &[Value],
+/// Borrowed keys: zero allocations (feature-gated — reads typed AxNodes).
+#[cfg(feature = "browser")]
+fn ax_parent_maps<'a>(
+    nodes: &[&'a AxNode],
 ) -> (
-    std::collections::HashMap<&str, &str>,
-    std::collections::HashMap<&str, &str>,
+    std::collections::HashMap<&'a str, &'a str>,
+    std::collections::HashMap<&'a str, &'a str>,
 ) {
     let mut by_id: std::collections::HashMap<&str, &str> =
         std::collections::HashMap::with_capacity(nodes.len());
     let mut by_child: std::collections::HashMap<&str, &str> =
         std::collections::HashMap::with_capacity(nodes.len() * 2);
     for node in nodes {
-        let Some(id) = node.get("nodeId").and_then(Value::as_str) else {
-            continue;
-        };
-        if let Some(parent) = node.get("parentId").and_then(Value::as_str) {
-            by_id.insert(id, parent);
+        let id = node.node_id.as_ref();
+        if let Some(parent) = node.parent_id.as_ref() {
+            by_id.insert(id, parent.as_ref());
         }
-        if let Some(children) = node.get("childIds").and_then(Value::as_array) {
-            for child in children.iter().filter_map(Value::as_str) {
-                by_child.entry(child).or_insert(id);
+        if let Some(children) = node.child_ids.as_ref() {
+            for child in children {
+                by_child.entry(child.as_ref()).or_insert(id);
             }
         }
     }
@@ -1740,14 +2052,14 @@ fn ax_parent_maps(
 
 /// TRUE tree depth (root = 0) via memoized climb: the parent edge comes from
 /// `parentId` or the childIds reverse map. Memoization makes the whole
-/// snapshot's depth computation O(n) total. A missing/cyclic parent resolves
-/// to 0 instead of looping.
-#[cfg_attr(not(feature = "browser"), allow(dead_code))]
-fn ax_depth(
-    id: &str,
-    by_id: &std::collections::HashMap<&str, &str>,
-    by_child: &std::collections::HashMap<&str, &str>,
-    cache: &mut std::collections::HashMap<String, usize>,
+/// snapshot's depth computation O(n) total with borrowed keys. A missing or
+/// cyclic parent resolves to 0 instead of looping.
+#[cfg(feature = "browser")]
+fn ax_depth<'a>(
+    id: &'a str,
+    by_id: &std::collections::HashMap<&'a str, &'a str>,
+    by_child: &std::collections::HashMap<&'a str, &'a str>,
+    cache: &mut std::collections::HashMap<&'a str, usize>,
 ) -> usize {
     if let Some(d) = cache.get(id) {
         return *d;
@@ -1757,7 +2069,7 @@ fn ax_depth(
         Some(p) if p != id => ax_depth(p, by_id, by_child, cache) + 1,
         _ => 0,
     };
-    cache.insert(id.to_string(), depth);
+    cache.insert(id, depth);
     depth
 }
 
@@ -1946,16 +2258,75 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[cfg(feature = "browser")]
     #[test]
-    fn ax_text_extracts_strings_numbers_bools() {
-        let name = json!({"type": "string", "value": "Deploy"});
-        assert_eq!(ax_text(Some(&name)), "Deploy");
-        let num = json!({"type": "number", "value": 3});
-        assert_eq!(ax_text(Some(&num)), "3");
-        let b = json!({"type": "bool", "value": true});
-        assert_eq!(ax_text(Some(&b)), "true");
-        assert_eq!(ax_text(None), "");
-        assert_eq!(ax_text(Some(&json!({"type": "string"}))), "");
+    fn ax_value_text_and_cap_text_render_the_typed_shape() {
+        let name = AxValue::builder()
+            .r#type(AxValueType::ComputedString)
+            .value("Deploy")
+            .build()
+            .expect("string AxValue");
+        assert_eq!(ax_value_text(&name), Some("Deploy"));
+        // Numbers/bools are NOT display text: the renderer skips them.
+        let num = AxValue::builder()
+            .r#type(AxValueType::Number)
+            .value(3)
+            .build()
+            .expect("number AxValue");
+        assert_eq!(ax_value_text(&num), None);
+
+        // Density cap: long values keep the head + an honest ellipsis;
+        // short values pass through borrowed (zero alloc).
+        let long = "x".repeat(MAX_VALUE_CHARS * 3);
+        let capped = cap_text(&long, MAX_VALUE_CHARS);
+        assert_eq!(capped.chars().count(), MAX_VALUE_CHARS + 1); // + ellipsis
+        assert!(capped.ends_with('…'));
+        assert_eq!(cap_text("short", 10), "short");
+        // Multibyte safety: never a mid-char cut.
+        let uni = "áé👍".repeat(100);
+        assert!(cap_text(&uni, 10).chars().count() <= 11);
+    }
+
+    #[cfg(feature = "browser")]
+    #[test]
+    fn ax_node_states_read_properties_not_top_level() {
+        let bool_val = |v: bool| {
+            AxValue::builder()
+                .r#type(AxValueType::Boolean)
+                .value(v)
+                .build()
+                .expect("bool AxValue")
+        };
+        let node = AxNode::builder()
+            .node_id("7".to_string())
+            .ignored(false)
+            .propertie(AxProperty {
+                name: AxPropertyName::Disabled,
+                value: bool_val(true),
+            })
+            .propertie(AxProperty {
+                name: AxPropertyName::Checked,
+                value: AxValue::builder()
+                    .r#type(AxValueType::Token)
+                    .value("mixed")
+                    .build()
+                    .expect("token AxValue"),
+            })
+            .propertie(AxProperty {
+                name: AxPropertyName::Expanded,
+                value: bool_val(false),
+            })
+            .build()
+            .expect("AxNode");
+        let (disabled, focused, checked, expanded) = ax_node_states(&node);
+        assert!(disabled);
+        assert!(!focused);
+        assert_eq!(checked, Some("mixed"));
+        assert_eq!(expanded, Some("collapsed"));
+
+        // A node without properties renders clean (no phantom states).
+        let bare = AxNode::new("8".to_string(), false);
+        assert_eq!(ax_node_states(&bare), (false, false, None, None));
     }
 
     #[test]
@@ -2000,26 +2371,38 @@ mod tests {
         assert!(quad_center(&json!([[1.0, 2.0]])).is_none());
     }
 
+    #[cfg(feature = "browser")]
     #[test]
     fn ax_depth_reconstructs_the_real_hierarchy() {
+        let n = |id: &str, parent: Option<&str>, children: Vec<&str>| {
+            let mut b = AxNode::builder().node_id(id.to_string()).ignored(false);
+            if let Some(p) = parent {
+                b = b.parent_id(p.to_string());
+            }
+            if !children.is_empty() {
+                let owned: Vec<String> = children.into_iter().map(str::to_string).collect();
+                b = b.child_ids(owned);
+            }
+            b.build().expect("AxNode")
+        };
         let tree = vec![
-            json!({"nodeId": "1", "childIds": ["2", "3"]}),
-            json!({"nodeId": "2", "parentId": "1", "childIds": ["4"]}),
-            json!({"nodeId": "3", "parentId": "1"}),
-            json!({"nodeId": "4", "childIds": ["5"]}), // parent only via childIds
-            json!({"nodeId": "5", "parentId": "4"}),
-            json!({"nodeId": "9"}), // detached root
+            n("1", None, vec!["2", "3"]),
+            n("2", Some("1"), vec!["4"]),
+            n("3", Some("1"), vec![]),
+            n("4", None, vec!["5"]), // parent only via childIds
+            n("5", Some("4"), vec![]),
+            n("9", None, vec![]), // detached root
         ];
-        let (by_id, by_child) = ax_parent_maps(&tree);
+        let refs: Vec<&AxNode> = tree.iter().collect();
+        let (by_id, by_child) = ax_parent_maps(&refs);
         let mut cache = std::collections::HashMap::new();
-        let mut d = |id: &str| ax_depth(id, &by_id, &by_child, &mut cache);
-        assert_eq!(d("1"), 0);
-        assert_eq!(d("2"), 1);
-        assert_eq!(d("3"), 1);
-        assert_eq!(d("4"), 2);
-        assert_eq!(d("5"), 3);
-        assert_eq!(d("9"), 0);
-        assert_eq!(d("missing"), 0);
+        assert_eq!(ax_depth("1", &by_id, &by_child, &mut cache), 0);
+        assert_eq!(ax_depth("2", &by_id, &by_child, &mut cache), 1);
+        assert_eq!(ax_depth("3", &by_id, &by_child, &mut cache), 1);
+        assert_eq!(ax_depth("4", &by_id, &by_child, &mut cache), 2);
+        assert_eq!(ax_depth("5", &by_id, &by_child, &mut cache), 3);
+        assert_eq!(ax_depth("9", &by_id, &by_child, &mut cache), 0);
+        assert_eq!(ax_depth("missing", &by_id, &by_child, &mut cache), 0);
     }
 
     #[test]
