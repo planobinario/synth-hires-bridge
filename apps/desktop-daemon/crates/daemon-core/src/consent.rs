@@ -114,3 +114,170 @@ impl Default for ConsentBroker {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: build a sample prompt with the given id.
+    fn make_prompt(id: &str) -> ConsentPrompt {
+        ConsentPrompt {
+            action_id: id.to_string(),
+            capability: "desktop.fs.write".to_string(),
+            summary: "Write to file".to_string(),
+            path: Some("/home/user/notes.txt".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_ask_creates_pending_prompt() {
+        let broker = ConsentBroker::new();
+        let _rx = broker.ask(make_prompt("action_42"));
+        let pending = broker.pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].action_id, "action_42");
+    }
+
+    #[test]
+    fn test_answer_approved_resolves_receiver() {
+        let broker = ConsentBroker::new();
+        let rx = broker.ask(make_prompt("action_01"));
+        // Not yet answered — receiver should be pending.
+        assert!(!rx.is_closed());
+        let ok = broker.answer("action_01", ConsentAnswer { approved: true, remember: false });
+        assert!(ok);
+        // Receiver should now be ready with the answer.
+        let ans = rx.try_recv().expect("receiver should resolve");
+        assert!(ans.approved);
+        assert!(!ans.remember);
+    }
+
+    #[test]
+    fn test_answer_remember_flag_propagates() {
+        let broker = ConsentBroker::new();
+        let rx = broker.ask(make_prompt("action_02"));
+        let ok = broker.answer("action_02", ConsentAnswer { approved: true, remember: true });
+        assert!(ok);
+        let ans = rx.try_recv().expect("receiver should resolve");
+        assert!(ans.approved);
+        assert!(ans.remember);
+    }
+
+    #[test]
+    fn test_answer_denied() {
+        let broker = ConsentBroker::new();
+        let rx = broker.ask(make_prompt("action_03"));
+        let ok = broker.answer("action_03", ConsentAnswer { approved: false, remember: false });
+        assert!(ok);
+        let ans = rx.try_recv().expect("receiver should resolve");
+        assert!(!ans.approved);
+    }
+
+    #[test]
+    fn test_answer_unknown_id_returns_false() {
+        let broker = ConsentBroker::new();
+        broker.ask(make_prompt("action_04"));
+        let ok = broker.answer("nonexistent", ConsentAnswer { approved: true, remember: false });
+        assert!(!ok);
+    }
+
+    #[test]
+    fn test_answer_removes_from_pending() {
+        let broker = ConsentBroker::new();
+        broker.ask(make_prompt("action_05"));
+        assert_eq!(broker.pending().len(), 1);
+        broker.answer("action_05", ConsentAnswer { approved: true, remember: false });
+        assert!(broker.pending().is_empty());
+    }
+
+    // ---- Notifier (wake-up) tests ----
+
+    #[tokio::test]
+    async fn test_notified_wakes_parked_action() {
+        let broker = ConsentBroker::new();
+        // Install the decision channel the WS client would create.
+        let (notif_tx, mut notif_rx) = mpsc::unbounded_channel();
+        broker.set_notifier(notif_tx);
+        let rx = broker.ask(make_prompt("action_06"));
+        // Answering should:
+        //   1. deliver the ConsentAnswer to the oneshot receiver (rx)
+        //   2. fire a (action_id, answer) tuple into the notifier channel
+        let ok = broker.answer("action_06", ConsentAnswer { approved: true, remember: false });
+        assert!(ok);
+        // Immediate answer on the oneshot.
+        let ans = rx.try_recv().expect("oneshot should deliver");
+        assert!(ans.approved);
+        // The notifier should have woken the WS loop.
+        let woke = notif_rx.try_recv().expect("notifier should wake");
+        assert_eq!(woke.0, "action_06");
+        assert!(woke.1.approved);
+    }
+
+    #[tokio::test]
+    async fn test_no_notifier_does_not_panic() {
+        // set_notifier not called → answering a real prompt must still work
+        // (the answer reaches the oneshot), just the wake-up is skipped.
+        let broker = ConsentBroker::new();
+        let rx = broker.ask(make_prompt("action_07"));
+        let ok = broker.answer("action_07", ConsentAnswer { approved: false, remember: false });
+        assert!(ok);
+        let ans = rx.try_recv().expect("oneshot should still deliver");
+        assert!(!ans.approved);
+    }
+
+    #[tokio::test]
+    async fn test_double_answer_idempotent() {
+        // A second answer for the same id should return false (prompt
+        // already removed) and NOT fire a second notification.
+        let broker = ConsentBroker::new();
+        let (notif_tx, mut notif_rx) = mpsc::unbounded_channel();
+        broker.set_notifier(notif_tx);
+        let rx = broker.ask(make_prompt("action_08"));
+        assert!(broker.answer("action_08", ConsentAnswer { approved: true, remember: false }));
+        assert!(!broker.answer("action_08", ConsentAnswer { approved: false, remember: false }));
+        // oneshot resolves to the FIRST answer.
+        let ans = rx.try_recv().expect("oneshot should deliver first answer");
+        assert!(ans.approved);
+        // Exactly one notification fired.
+        notif_rx.try_recv().expect("first notification");
+        assert!(notif_rx.try_recv().is_err(), "no duplicate notification");
+    }
+
+    #[test]
+    fn test_multiple_concurrent_prompts() {
+        let broker = ConsentBroker::new();
+        let rx_a = broker.ask(make_prompt("a"));
+        let rx_b = broker.ask(make_prompt("b"));
+        let rx_c = broker.ask(make_prompt("c"));
+        assert_eq!(broker.pending().len(), 3);
+        // Answer in non-sequential order.
+        assert!(broker.answer("c", ConsentAnswer { approved: true, remember: false }));
+        assert!(broker.answer("a", ConsentAnswer { approved: false, remember: false }));
+        assert!(broker.answer("b", ConsentAnswer { approved: true, remember: true }));
+        assert_eq!(rx_a.try_recv().unwrap().approved, false);
+        assert_eq!(rx_b.try_recv().unwrap().approved, true);
+        assert_eq!(rx_c.try_recv().unwrap().approved, true);
+        assert!(broker.pending().is_empty());
+    }
+
+    #[test]
+    fn test_default_impl() {
+        let broker = ConsentBroker::default();
+        assert!(broker.pending().is_empty());
+    }
+
+    #[test]
+    fn test_answer_denied_no_wake() {
+        let broker = ConsentBroker::new();
+        let (notif_tx, mut notif_rx) = mpsc::unbounded_channel();
+        broker.set_notifier(notif_tx);
+        let rx = broker.ask(make_prompt("action_10"));
+        let ok = broker.answer("action_10", ConsentAnswer { approved: false, remember: false });
+        assert!(ok);
+        let ans = rx.try_recv().expect("receiver should resolve");
+        assert!(!ans.approved);
+        // Even a denied answer wakes the parked action.
+        let woke = notif_rx.try_recv().expect("notifier should wake even on deny");
+        assert_eq!(woke.1.approved, false);
+    }
+}

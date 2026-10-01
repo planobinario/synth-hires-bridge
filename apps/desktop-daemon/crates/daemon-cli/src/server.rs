@@ -62,12 +62,7 @@ pub async fn start_http_server(
     // CORS estricto con PNA (Private Network Access)
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(|origin, _parts| {
-            let o = origin.as_bytes();
-            o == b"https://synthhires.com"
-                || o == b"http://localhost:4321"
-                || o == b"http://127.0.0.1:4321"
-                || o == b"http://localhost:8787"
-                || o == b"http://127.0.0.1:8787"
+            origin.to_str().map(is_allowed_origin).unwrap_or(false)
         }))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE])
@@ -91,17 +86,25 @@ pub async fn start_http_server(
     Ok(())
 }
 
+fn is_allowed_origin(origin: &str) -> bool {
+    if origin == "https://synthhires.com" {
+        return true;
+    }
+    if let Some(rest) = origin.strip_prefix("http://localhost:") {
+        return rest.chars().all(|c| c.is_ascii_digit());
+    }
+    if let Some(rest) = origin.strip_prefix("http://127.0.0.1:") {
+        return rest.chars().all(|c| c.is_ascii_digit());
+    }
+    false
+}
+
 fn check_origin(headers: &axum::http::HeaderMap) -> Result<(), (StatusCode, &'static str)> {
     let origin = headers
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if origin != "https://synthhires.com"
-        && origin != "http://localhost:4321"
-        && origin != "http://127.0.0.1:4321"
-        && origin != "http://localhost:8787"
-        && origin != "http://127.0.0.1:8787"
-    {
+    if !is_allowed_origin(origin) {
         tracing::warn!("Rejecting request from invalid origin: {}", origin);
         return Err((StatusCode::FORBIDDEN, "Invalid Origin"));
     }
@@ -302,4 +305,62 @@ async fn handle_unpair(
         .send("Esperando emparejamiento...".to_string());
     tracing::info!("Unpaired via local HTTP; ready for re-pairing");
     Ok(Json(serde_json::json!({ "success": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_allowed_origin;
+
+    #[test]
+    fn test_allowed_origin_production() {
+        assert!(is_allowed_origin("https://synthhires.com"));
+    }
+
+    #[test]
+    fn test_allowed_localhost_ports() {
+        assert!(is_allowed_origin("http://localhost:3000"));
+        assert!(is_allowed_origin("http://localhost:8788"));
+        assert!(is_allowed_origin("http://127.0.0.1:8788"));
+        assert!(is_allowed_origin("http://127.0.0.1:4323"));
+    }
+
+    #[test]
+    fn test_rejected_origin_http_prod() {
+        // Production origin is HTTPS-only — a stray http:// must be rejected.
+        assert!(!is_allowed_origin("http://synthhires.com"));
+    }
+
+    #[test]
+    fn test_rejected_origin_non_numeric_port() {
+        // Non-numeric port segment → reject (path injection defense).
+        assert!(!is_allowed_origin("http://localhost:abc"));
+        assert!(!is_allowed_origin("http://127.0.0.1:878a"));
+    }
+
+    #[test]
+    fn test_rejected_origin_path_injection() {
+        // A path or extra suffix after the port must be rejected — this
+        // is the host-guard invariant: only `<host>:<digits>` is allowed.
+        assert!(!is_allowed_origin("http://localhost:3000/malicious"));
+        assert!(!is_allowed_origin("http://127.0.0.1:8788/__bridge/consent-relay"));
+    }
+
+    #[test]
+    fn test_rejected_origin_arbitrary_domain() {
+        assert!(!is_allowed_origin("https://evil.example.com"));
+        assert!(!is_allowed_origin("https://synthhires.com.evil.com"));
+    }
+
+    #[test]
+    fn test_rejected_empty_origin() {
+        assert!(!is_allowed_origin(""));
+        assert!(!is_allowed_origin("null"));
+    }
+
+    #[test]
+    fn test_rejected_https_localhost() {
+        // HTTPS to localhost is not in the allow-list (no localhost cert).
+        assert!(!is_allowed_origin("https://localhost:3000"));
+        assert!(!is_allowed_origin("https://127.0.0.1:3000"));
+    }
 }

@@ -39,8 +39,12 @@ DEEPSEEK_API_KEY=sk-... bash apps/desktop-daemon/e2e/full-pipeline.sh --agent
 | 5 | code AST (edit) | replacements verified; adjacent structure intact |
 | 6 | shell | exit codes/stdout honest (incl. failing command) |
 | 7 | scope enforcement | ungranted capability rejected; consent required outside allow-paths |
-| 8 | zombie watchdog (optional `--watchdog`) | SIGSTOP runtime → auto-reconnect → action OK |
-| 9 | agent loop (optional, real model) | tool calls with correct deviceId; results on disk |
+| 8 | undo/checkpoint | write → checkpointed pre-image → destructive write → restore byte-for-byte |
+| 9 | zombie watchdog (optional `--watchdog`) | SIGSTOP runtime → auto-reconnect → action OK |
+| 10 | consent relay web-first | out-of-allowpath write → web-approved → daemon resumes & executes |
+| 11 | consent relay denial | web-denied → action never executes (one-shot consumed) |
+| 12 | sandboxing (S11) | 4 MiB stream truncation marker + 2 MB fs.write → 413 actionable |
+| 13 | agent loop (optional, real model) | tool calls with correct deviceId; results on disk |
 
 ## Notes
 - wrangler/miniflare on NixOS needs `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt`

@@ -83,11 +83,11 @@ jobs:
           if [ -n "${{ matrix.extra_features }}" ]; then FEATURES_FLAG="--features ${{ matrix.extra_features }}"; fi
           if [ "${{ matrix.use_cross }}" = "true" ]; then
             cross build --release --target ${{ matrix.target }} $FEATURES_FLAG
-            BIN="target/${{ matrix.target }}/release/synthhires-bridge"
+            BIN="target/${{ matrix.target }}/release/synth-hires-bridge"
             if [[ "${{ matrix.target }}" == *"windows"* ]]; then BIN="$BIN.exe"; fi
           else
             cargo build --release --target ${{ matrix.target }} $FEATURES_FLAG
-            BIN="target/${{ matrix.target }}/release/synthhires-bridge"
+            BIN="target/${{ matrix.target }}/release/synth-hires-bridge"
           fi
           cp "$BIN" "${{ matrix.artifact }}"
       - name: Upload artifact

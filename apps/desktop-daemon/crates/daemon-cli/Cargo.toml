@@ -8,7 +8,7 @@ authors.workspace = true
 description = "SynthHires Desktop Daemon — bridges the agent to your PC's filesystem and terminal."
 
 [[bin]]
-name = "synthhires-bridge"
+name = "synth-hires-bridge"
 path = "src/main.rs"
 
 [features]

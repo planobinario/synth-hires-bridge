@@ -38,7 +38,7 @@
       in
       {
         packages.default = pkgs.rustPlatform.buildRustPackage {
-          pname = "synthhires-bridge";
+          pname = "synth-hires-bridge";
           version = "0.1.21";
           # Wrap the repo so the unpacked source gets a STABLE directory name
           # (`synthhires-bridge-source`): plain store-path srcs (src = ./.)
@@ -62,7 +62,7 @@
             homepage = "https://github.com/planobinario/synthhires-bridge";
             license = licenses.mit;
             maintainers = [];
-            mainProgram = "synthhires-bridge";
+            mainProgram = "synth-hires-bridge";
             platforms = platforms.linux;
           };
         };
@@ -79,9 +79,9 @@
     ) // {
       nixosModules.default = { config, lib, pkgs, ... }:
         let
-          cfg = config.services.synthhires-bridge;
+          cfg = config.services.synth-hires-bridge;
         in {
-          options.services.synthhires-bridge = {
+          options.services.synth-hires-bridge = {
             enable = lib.mkEnableOption "SynthHires Bridge Desktop Daemon";
             package = lib.mkOption {
               type = lib.types.package;
@@ -96,7 +96,7 @@
               wantedBy = [ "graphical-session.target" ];
               partOf = [ "graphical-session.target" ];
               serviceConfig = {
-                ExecStart = "${cfg.package}/bin/synthhires-bridge run";
+                ExecStart = "${cfg.package}/bin/synth-hires-bridge run";
                 Restart = "on-failure";
                 RestartSec = "5s";
               };
