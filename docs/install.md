@@ -43,16 +43,22 @@ Pin reproducible hosts with `--tag vX.Y.Z` instead of the rolling `edge`.
 
 ## Docker (advanced)
 
+Prebuilt multi-arch image (amd64/arm64) published by CI on every `main` push
+and `v*` tag — no local build needed:
+
 ```bash
-docker build -t synthhires-bridge:edge .
+docker pull ghcr.io/planobinario/synthhires-bridge:edge
 docker run -d --name bridge --restart unless-stopped \
   -v bridge-data:/data \
   -v "${XDG_RUNTIME_DIR}/bus:${XDG_RUNTIME_DIR}/bus" \
   -e DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus" \
   -e SYNTHHIRES_BACKEND_URL=https://synthhires.com \
-  synthhires-bridge:edge run
+  ghcr.io/planobinario/synthhires-bridge:edge run
 docker exec bridge synthhires-bridge pair https://synthhires.com <CODE>
 ```
+
+(From source instead: `docker build -t synthhires-bridge:edge .` — the
+Dockerfile downloads the matching release asset at build time.)
 
 Why the dbus mount: the device token lives in the **OS keyring** (Secret
 Service on Linux). Without it the daemon cannot persist pairing — that is a
@@ -64,3 +70,12 @@ security property, not a bug. If your host has no Secret Service, prefer
 - Local: `bash install.sh --uninstall`, or `synthhires-bridge unpair`.
 - Server-side (kills the token everywhere, closes the WS in ms): Connections
   → *Revoke* on the web.
+
+## Updates
+
+- `v*` releases ship a signed `release-manifest-<ver>.json` (Ed25519, key in
+  CI secrets; pubkey baked into the binaries). The daemon verifies the
+  signature before trusting hashes — a compromised mirror cannot push
+  binaries. Rolling `edge` stays unsigned: pin `--tag vX.Y.Z` (or the
+  `:vX.Y.Z` image) for verifiable hosts.
+- NixOS follows nix, not auto-update: `nix flake update` in your config.

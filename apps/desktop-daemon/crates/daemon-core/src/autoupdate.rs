@@ -25,13 +25,18 @@ use sha2::{Digest, Sha256};
 use crate::{DaemonError, Result};
 
 /// Compile-time embedded Ed25519 public key (hex-encoded).
-/// Set via `SYNTHHIRES_UPDATE_PUBKEY` env var in CI builds.
+/// Set via `SYNTHHIRES_UPDATE_PUBKEY` env var in CI builds (repo variable
+/// `UPDATE_PUBKEY_HEX`; private half lives in the `UPDATE_SIGNING_KEY`
+/// secret and never leaves CI).
 fn update_pubkey_hex() -> &'static str {
     option_env!("SYNTHHIRES_UPDATE_PUBKEY")
         .unwrap_or("cddb85d58da4192d7d59f2e086bb6d84cbf6581c0b654845620f21c64eaa2e0c")
 }
 
-const RELEASES_API: &str = "https://api.github.com/repos/planobinario/synth-hires/releases";
+// NOTE: releases live in the BRIDGE repo (assets + manifests). An older
+// revision pointed at the web repo (`synth-hires`), where no manifest will
+// ever exist — every check hard-failed.
+const RELEASES_API: &str = "https://api.github.com/repos/planobinario/synthhires-bridge/releases";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -124,6 +129,35 @@ fn verify_manifest_signature(raw_json: &[u8]) -> bool {
     pubkey.verify_strict(&canonical, &sig).is_ok()
 }
 
+/// Numeric dotted-version comparison (`1.2` == `1.2.0`; missing parts are 0).
+/// A bare lexicographic `>=` mis-orders `0.1.9` vs `0.1.21` (`'9' > '2'`),
+/// which would pin users on 0.1.9 forever. Non-numeric input fails closed
+/// (never triggers an update).
+fn is_newer_version(current: &str, latest: &str) -> bool {
+    fn parts(v: &str) -> Option<Vec<u64>> {
+        let core = v
+            .strip_prefix("v")
+            .unwrap_or(v)
+            .split(|c| c == '-' || c == '+')
+            .next()?;
+        core
+            .split('.')
+            .map(|p| p.parse::<u64>().ok())
+            .collect::<Option<Vec<_>>>()
+    }
+    let (Some(a), Some(b)) = (parts(current), parts(latest)) else {
+        return false;
+    };
+    let len = a.len().max(b.len());
+    for i in 0..len {
+        let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
+        if x != y {
+            return y > x;
+        }
+    }
+    false
+}
+
 /// Fetches the latest release manifest from GitHub Releases,
 /// verifies its Ed25519 signature against the embedded public key,
 /// and determines whether an update is available.
@@ -149,14 +183,15 @@ pub async fn check_for_update(current_version: &str) -> UpdateStatus {
     };
 
     let tag_name = release["tag_name"].as_str().unwrap_or("unknown");
-    let latest_version = tag_name.strip_prefix("daemon-v").unwrap_or(tag_name);
+    // Versioned releases are tagged `vX.Y.Z` (see apps/desktop-daemon/AGENTS.md).
+    let latest_version = tag_name.strip_prefix("v").unwrap_or(tag_name);
 
-    if current_version >= latest_version {
+    if !is_newer_version(current_version, latest_version) {
         return UpdateStatus::UpToDate;
     }
 
     let manifest_url = format!(
-        "{RELEASES_API}/download/daemon-v{latest_version}/release-manifest-{latest_version}.json"
+        "{RELEASES_API}/download/v{latest_version}/release-manifest-{latest_version}.json"
     );
     let manifest_resp = match client.get(&manifest_url).send().await {
         Ok(r) => r,
@@ -272,6 +307,21 @@ mod tests {
                 || t == "aarch64-apple-darwin",
             "unknown target triple: {t}"
         );
+    }
+
+    #[test]
+    fn test_is_newer_version_numeric() {
+        // The lexicographic trap: "0.1.9" >= "0.1.21" as strings.
+        assert!(is_newer_version("0.1.9", "0.1.21"));
+        assert!(!is_newer_version("0.1.21", "0.1.9"));
+        assert!(!is_newer_version("0.1.21", "0.1.21"));
+        assert!(is_newer_version("0.1.21", "0.2.0"));
+        assert!(is_newer_version("1.2", "1.2.1"));
+        assert!(!is_newer_version("1.2.0", "1.2"));
+        assert!(is_newer_version("v0.1.21", "0.1.22"));
+        // Garbage fails closed: never an update.
+        assert!(!is_newer_version("0.1.21", "unknown"));
+        assert!(!is_newer_version("dev", "0.1.22"));
     }
 
     #[test]
