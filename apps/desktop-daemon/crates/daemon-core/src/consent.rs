@@ -141,9 +141,14 @@ mod tests {
     #[test]
     fn test_answer_approved_resolves_receiver() {
         let broker = ConsentBroker::new();
-        let rx = broker.ask(make_prompt("action_01"));
-        // Not yet answered — receiver should be pending.
-        assert!(!rx.is_closed());
+        let mut rx = broker.ask(make_prompt("action_01"));
+        // Not yet answered — receiver should be pending. (`is_closed` does
+        // not exist on tokio 1.53's Receiver; try_recv(Empty) is the same
+        // fact without consuming anything.)
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
         let ok = broker.answer("action_01", ConsentAnswer { approved: true, remember: false });
         assert!(ok);
         // Receiver should now be ready with the answer.
@@ -155,7 +160,7 @@ mod tests {
     #[test]
     fn test_answer_remember_flag_propagates() {
         let broker = ConsentBroker::new();
-        let rx = broker.ask(make_prompt("action_02"));
+        let mut rx = broker.ask(make_prompt("action_02"));
         let ok = broker.answer("action_02", ConsentAnswer { approved: true, remember: true });
         assert!(ok);
         let ans = rx.try_recv().expect("receiver should resolve");
@@ -166,7 +171,7 @@ mod tests {
     #[test]
     fn test_answer_denied() {
         let broker = ConsentBroker::new();
-        let rx = broker.ask(make_prompt("action_03"));
+        let mut rx = broker.ask(make_prompt("action_03"));
         let ok = broker.answer("action_03", ConsentAnswer { approved: false, remember: false });
         assert!(ok);
         let ans = rx.try_recv().expect("receiver should resolve");
@@ -198,7 +203,7 @@ mod tests {
         // Install the decision channel the WS client would create.
         let (notif_tx, mut notif_rx) = mpsc::unbounded_channel();
         broker.set_notifier(notif_tx);
-        let rx = broker.ask(make_prompt("action_06"));
+        let mut rx = broker.ask(make_prompt("action_06"));
         // Answering should:
         //   1. deliver the ConsentAnswer to the oneshot receiver (rx)
         //   2. fire a (action_id, answer) tuple into the notifier channel
@@ -218,7 +223,7 @@ mod tests {
         // set_notifier not called → answering a real prompt must still work
         // (the answer reaches the oneshot), just the wake-up is skipped.
         let broker = ConsentBroker::new();
-        let rx = broker.ask(make_prompt("action_07"));
+        let mut rx = broker.ask(make_prompt("action_07"));
         let ok = broker.answer("action_07", ConsentAnswer { approved: false, remember: false });
         assert!(ok);
         let ans = rx.try_recv().expect("oneshot should still deliver");
@@ -232,7 +237,7 @@ mod tests {
         let broker = ConsentBroker::new();
         let (notif_tx, mut notif_rx) = mpsc::unbounded_channel();
         broker.set_notifier(notif_tx);
-        let rx = broker.ask(make_prompt("action_08"));
+        let mut rx = broker.ask(make_prompt("action_08"));
         assert!(broker.answer("action_08", ConsentAnswer { approved: true, remember: false }));
         assert!(!broker.answer("action_08", ConsentAnswer { approved: false, remember: false }));
         // oneshot resolves to the FIRST answer.
@@ -246,9 +251,9 @@ mod tests {
     #[test]
     fn test_multiple_concurrent_prompts() {
         let broker = ConsentBroker::new();
-        let rx_a = broker.ask(make_prompt("a"));
-        let rx_b = broker.ask(make_prompt("b"));
-        let rx_c = broker.ask(make_prompt("c"));
+        let mut rx_a = broker.ask(make_prompt("a"));
+        let mut rx_b = broker.ask(make_prompt("b"));
+        let mut rx_c = broker.ask(make_prompt("c"));
         assert_eq!(broker.pending().len(), 3);
         // Answer in non-sequential order.
         assert!(broker.answer("c", ConsentAnswer { approved: true, remember: false }));
@@ -271,7 +276,7 @@ mod tests {
         let broker = ConsentBroker::new();
         let (notif_tx, mut notif_rx) = mpsc::unbounded_channel();
         broker.set_notifier(notif_tx);
-        let rx = broker.ask(make_prompt("action_10"));
+        let mut rx = broker.ask(make_prompt("action_10"));
         let ok = broker.answer("action_10", ConsentAnswer { approved: false, remember: false });
         assert!(ok);
         let ans = rx.try_recv().expect("receiver should resolve");
