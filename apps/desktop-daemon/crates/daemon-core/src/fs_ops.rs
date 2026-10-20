@@ -141,11 +141,7 @@ impl<'a> FsOps<'a> {
             .parent()
             .ok_or_else(|| DaemonError::PathDenied(format!("{}: no parent", req.path.display())))?;
         fs::create_dir_all(parent).await.map_err(DaemonError::Io)?;
-        let tmp = req.path.with_extension("synthhires-tmp");
-        fs::write(&tmp, req.content.as_bytes())
-            .await
-            .map_err(DaemonError::Io)?;
-        fs::rename(&tmp, &req.path).await.map_err(DaemonError::Io)?;
+        write_via_unique_tmp(&req.path, req.content.as_bytes()).await?;
         // Empirical verification: read back what we just wrote. Only a
         // byte-identical file is reported as verified. This is the same
         // honesty guarantee as the web-side local tools.
@@ -353,6 +349,43 @@ impl<'a> FsOps<'a> {
     }
 }
 
+/// Atomic write via a unique, exclusively-created tmp sibling + rename.
+///
+/// Two hardening properties over a deterministic `.synthhires-tmp` name:
+/// (1) the name carries a fresh UUID, so a local attacker cannot
+/// pre-squat it as a symlink (they would have to guess 122 bits);
+/// (2) `create_new` + a post-write `symlink_metadata` check refuse the
+/// write if the tmp is somehow a symlink instead of the regular file we
+/// created — the content must never flow through a planted link, and the
+/// rename must move OUR bytes, not someone else's link.
+async fn write_via_unique_tmp(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension(format!(
+        "synthhires-tmp-{}",
+        uuid::Uuid::new_v4().to_string()
+    ));
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .await
+            .map_err(DaemonError::Io)?;
+        f.write_all(bytes).await.map_err(DaemonError::Io)?;
+        f.sync_all().await.map_err(DaemonError::Io)?;
+    }
+    let meta = fs::symlink_metadata(&tmp).await.map_err(DaemonError::Io)?;
+    if meta.file_type().is_symlink() {
+        let _ = fs::remove_file(&tmp).await;
+        return Err(DaemonError::PathDenied(format!(
+            "{}: tmp path is a symlink — refusing atomic write",
+            path.display()
+        )));
+    }
+    fs::rename(&tmp, path).await.map_err(DaemonError::Io)?;
+    Ok(())
+}
+
 /// Minimal base64 encoder so we don't pull in the `base64` crate.
 fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -456,14 +489,25 @@ fn anchor_matches(actual: &[String], expected: Option<&str>) -> bool {
         .all(|h| actual.iter().any(|a| a == h))
 }
 
+/// Annotate every line with its number and hash, KEEPING the content.
+///
+/// The format is `<n> | <hash> | <content>`. The content is part of the
+/// line on purpose: an annotated read that dropped the text would hand
+/// the model a file it can see the shape of but cannot read, and the
+/// tool's own description promises the content ("cada línea vuelve como
+/// `NNNN | hash | contenido`"). `hashline_lineno` still parses the
+/// number (it splits on the first separator) and `anchor_matches` still
+/// compares the hashes, so the patch path is unaffected.
 fn annotate_content(content: &str) -> String {
-    let mut out = String::with_capacity(content.len() + content.lines().count() * 12);
+    let mut out = String::with_capacity(content.len() + content.lines().count() * 16);
     for (idx, line) in content.lines().enumerate() {
         out.push_str(&format!(
-            "{}{}{}\n",
+            "{}{}{}{}{}\n",
             idx + 1,
             HASHLINE_PREFIX,
-            short_hash(line)
+            short_hash(line),
+            HASHLINE_PREFIX,
+            line
         ));
     }
     out
@@ -551,13 +595,8 @@ impl<'a> FsOps<'a> {
         if original_bytes.ends_with(b"\n") {
             content.push('\n');
         }
-        let tmp = req.path.with_extension("synthhires-tmp");
-        fs::write(&tmp, content.as_bytes()).await.map_err(DaemonError::Io)?;
-        if fs::rename(&tmp, &req.path).await.is_err() {
-            let _ = fs::remove_file(&tmp).await;
-            return Err(DaemonError::Io(std::io::Error::other(
-                "patch rename failed",
-            )));
+        if let Err(e) = write_via_unique_tmp(&req.path, content.as_bytes()).await {
+            return Err(e);
         }
         let written = fs::read(&req.path).await.map_err(DaemonError::Io)?;
         let verified = written == content.as_bytes();
@@ -762,6 +801,34 @@ mod hashline_tests {
         assert!(overlap.is_err());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// The hash must agree BYTE FOR BYTE with the web's implementation
+    /// (src/lib/agent/tools/contract/format.ts in the synth-hires repo).
+    /// If the two ever diverge, every anchored edit fails with
+    /// `stale_anchor` and the agent cannot edit anything at all — so the
+    /// vectors are pinned on BOTH sides.
+    #[test]
+    fn short_hash_matches_the_web_vectors() {
+        assert_eq!(short_hash("hola"), "b221d9");
+        assert_eq!(short_hash("const x = 1"), "a0d94c");
+        assert_eq!(short_hash("fn main() {}"), "ef3263");
+        assert_eq!(short_hash(""), "e3b0c4");
+    }
+
+    /// An annotated read must KEEP the content: the model has to be able
+    /// to read the file it is about to edit.
+    #[test]
+    fn annotate_keeps_the_content() {
+        let out = annotate_content("uno\ndos\n");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("1 | "), "got {:?}", lines[0]);
+        assert!(lines[0].ends_with(" | uno"), "content lost: {:?}", lines[0]);
+        assert!(lines[1].ends_with(" | dos"), "content lost: {:?}", lines[1]);
+        // The number still parses: the patch path reads it back.
+        assert_eq!(hashline_lineno(lines[0]), Some(1));
+        assert_eq!(hashline_lineno(lines[1]), Some(2));
     }
 
     #[test]
