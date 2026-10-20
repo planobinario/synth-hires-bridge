@@ -328,10 +328,17 @@ jobs:
             experimental-features = nix-command flakes
       - name: Build with Nix Flake
         run: nix build -L
+      - name: Check flake outputs (eval + module)
+        # Catches eval breakage (e.g. nixosModules.default referencing a
+        # renamed option) without building the world twice.
+        run: nix flake check
       - name: Stage Nix binary
         run: |
           mkdir -p nix_out
-          cp -L result/bin/synthhires-bridge nix_out/synthhires-bridge-nixos
+          # NOTE: Cargo [[bin]] name is `synth-hires-bridge` (with hyphen);
+          # releases rename it to `synthhires-bridge`. The NixOS asset is a
+          # raw store binary — runnable ONLY under nix (see install.sh guard).
+          cp -L result/bin/synth-hires-bridge nix_out/synthhires-bridge-nixos
       - uses: actions/upload-artifact@v4
         with:
           name: synthhires-bridge-nixos
@@ -399,7 +406,10 @@ jobs:
   # ── 6. Container image (GHCR, multi-arch) ─────────────────────────────────
   # Self-downloading Dockerfile: pulls the matching edge/v* asset at build
   # time, so this job needs no Rust toolchain and no binary artifacts.
+  # `needs: [publish]` is LOAD-BEARING: without it the image bakes the
+  # PREVIOUS edge asset (race between upload and docker build on main).
   docker:
+    needs: [publish]
     runs-on: ubuntu-latest
     permissions:
       contents: read
