@@ -27,6 +27,14 @@
 
 use daemon_core::capability::{path_starts_with, path_starts_with_ignoring_case, paths_equal};
 
+// `raw_arg` is a method of the `CommandExt` TRAIT, and on Windows the
+// trait has to be in scope. The daemon's own shell code gets it from
+// `pty_ops.rs`; a test that forgets it does not fail on Linux (the
+// branch is compiled out) and fails on Windows — which is exactly why
+// this suite runs on a Windows runner.
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
+
 /// The contract's hash: the first 6 hex characters of SHA-256 over the
 /// line's own bytes, WITHOUT its terminator.
 ///
