@@ -195,15 +195,21 @@ impl WsClient {
         }
     }
 
-    /// Drop parked actions whose owner never answered within 2 minutes
-    /// (mirrors the cockpit's 3-minute prompt age guard). Called from the
-    /// heartbeat tick — the one code path that runs periodically.
+    /// Drop parked actions whose owner never answered within the daemon's
+    /// declared consent timeout.
+    ///
+    /// The web's cockpit used to keep the prompt visible for THREE
+    /// MINUTES while this sweep gave up after TWO, so an approval clicked
+    /// in the third minute was silently dropped. The daemon now declares
+    /// its timeout in the hello frame and the web honours it, so the two
+    /// lifetimes are the same number. Called from the heartbeat tick —
+    /// the one code path that runs periodically.
     async fn sweep_expired_parked(&self) {
         let now = now_ms();
         let mut parked = self.parked.lock().await;
         let expired: Vec<String> = parked
             .iter()
-            .filter(|(_, (_, at))| now.saturating_sub(*at) > 120_000)
+            .filter(|(_, (_, at))| now.saturating_sub(*at) > crate::consent::CONSENT_TIMEOUT_MS)
             .map(|(id, _)| id.clone())
             .collect();
         for id in expired {
@@ -354,6 +360,9 @@ impl WsClient {
             },
             device_name: self.device_name.clone(),
             client_version: env!("CARGO_PKG_VERSION").to_string(),
+            // The web honours this instead of guessing, so a prompt can
+            // never outlive the daemon's patience (or vice versa).
+            consent_timeout_ms: crate::consent::CONSENT_TIMEOUT_MS,
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
             // Protocol v1.1 capability negotiation. The web only dispatches

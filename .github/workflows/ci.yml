@@ -63,6 +63,50 @@ jobs:
           echo '== memory =='
           free -m || true
 
+  # The semantics that DIFFER between operating systems.
+  #
+  # The daemon runs on Windows, macOS and Linux against ONE contract, and
+  # the dangerous code is not the code that is the same everywhere — it
+  # is the code that is SUPPOSED to be the same and is not, because the
+  # filesystem underneath disagrees: case sensitivity, line endings, and
+  # the shell (`cmd.exe /C` with `raw_arg` vs `bash -lc`).
+  #
+  # This job runs those tests on Windows AND macOS, where the filesystem
+  # behaves differently from the developer's Linux box. The tests
+  # themselves are written to run everywhere — the ones that need
+  # Windows skip elsewhere — so the same suite covers the three
+  # platforms, and a failure names the platform that broke.
+  platform-semantics:
+    name: Platform semantics (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: apps/desktop-daemon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop-daemon
+      # The shell, the path rules and the line endings. This is the
+      # suite that fails when the daemon starts disagreeing with the
+      # contract on a platform the developer does not use.
+      - name: platform semantics
+        run: cargo test --profile ci -p daemon-core --test windows_semantics -- --test-threads=2
+      # The consent timeout is a CROSS-REPO number: the web pins
+      # 180 000 and the daemon must declare the same one, or the owner
+      # approves a prompt the daemon has already abandoned.
+      - name: consent timeout
+        run: cargo test --profile ci -p daemon-core --lib consent -- --test-threads=2
+      # The capability gate: the path rules that decide whether an
+      # action needs the user's consent.
+      - name: capability gate
+        run: cargo test --profile ci -p daemon-core --lib capability -- --test-threads=2
+
   nix-build:
     runs-on: ubuntu-latest
     steps:

@@ -43,6 +43,76 @@ impl From<&Scopes> for ScopeSnapshot {
     }
 }
 
+/// Whether `path` is inside `prefix`.
+///
+/// ── Why this is not `path.starts_with(prefix)` ─────────────────────────
+///
+/// On Windows the filesystem is case-INsensitive: `C:\Users\Me\Documents`
+/// and `c:\users\me\documents` are the SAME directory. Rust's
+/// `Path::starts_with` compares the components byte-wise, so a path the
+/// user had already granted stopped matching the moment the case
+/// changed — and the agent was asked for consent again for a directory
+/// the owner had already approved. It is not a security hole (the strict
+/// answer is "ask"), but it is a hole in the PRODUCT: the grant is
+/// useless if the next call spells it differently.
+///
+/// On Unix the comparison stays byte-exact: a case-sensitive filesystem
+/// means `Users` and `users` really are different directories, and
+/// pretending otherwise would WIDEN the grant.
+///
+/// The comparison is done on the components, so it never matches a
+/// partial component: `/srv/data` does not cover `/srv/database`.
+pub fn path_starts_with(path: &Path, prefix: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        path_starts_with_ignoring_case(path, prefix)
+    }
+    #[cfg(not(windows))]
+    {
+        path.starts_with(prefix)
+    }
+}
+
+/// Component-wise prefix comparison that ignores ASCII case.
+///
+/// Exposed (not private) so the test suite can pin it on EVERY platform:
+/// the behaviour that matters is only exercised on Windows in
+/// production, and a test that only runs on Windows is a test that only
+/// runs on the runner nobody looks at.
+pub fn path_starts_with_ignoring_case(path: &Path, prefix: &Path) -> bool {
+    let mut prefix_components = prefix.components();
+    for component in path.components() {
+        let Some(expected) = prefix_components.next() else {
+            // The prefix ran out: the path is deeper, which is a match.
+            return true;
+        };
+        let a = component.as_os_str().to_string_lossy();
+        let b = expected.as_os_str().to_string_lossy();
+        if !a.eq_ignore_ascii_case(&b) {
+            return false;
+        }
+    }
+    // Every component of the prefix was consumed by the path.
+    prefix_components.next().is_none()
+}
+
+/// Whether two paths are THE SAME path.
+///
+/// Same rule as `path_starts_with`: on Windows the filesystem ignores
+/// case, so a one-shot approval of `C:\Users\Me\notes.txt` must cover
+/// `c:\users\me\notes.txt`. On Unix the comparison stays byte-exact.
+pub fn paths_equal(path: &Path, other: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        path_starts_with_ignoring_case(path, other)
+            && path_starts_with_ignoring_case(other, path)
+    }
+    #[cfg(not(windows))]
+    {
+        path == other
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateDecision {
     Allow,
@@ -101,7 +171,7 @@ impl CapabilityGate {
         // One-shot owner consent covers the exact approved path (lexical
         // check here; the real-resolution guard in check_path_real also
         // honours it — see one_shot_paths docs for the threat model).
-        if self.snapshot.one_shot_paths.iter().any(|p| p == path) {
+        if self.snapshot.one_shot_paths.iter().any(|p| paths_equal(p, path)) {
             return GateDecision::Allow;
         }
         if self.path_matches_any(path) {
@@ -118,7 +188,7 @@ impl CapabilityGate {
 
         // Defensa 2: Verificar prefijo válido por componente
         for prefix in &self.snapshot.always_allow_paths {
-            if path.starts_with(prefix) {
+            if path_starts_with(path, prefix) {
                 return true;
             }
         }
@@ -155,7 +225,7 @@ impl CapabilityGate {
                     .snapshot
                     .one_shot_paths
                     .iter()
-                    .any(|p| p == path);
+                    .any(|p| paths_equal(p, path));
                 if one_shot_ok {
                     return Ok(GateDecision::Allow);
                 }
@@ -169,7 +239,7 @@ impl CapabilityGate {
                     .always_allow_paths
                     .iter()
                     .filter_map(|p| std::fs::canonicalize(p).ok())
-                    .any(|cp| real.starts_with(cp));
+                    .any(|cp| path_starts_with(&real, &cp));
                 if self.path_matches_any(&real) || canonically_allowed {
                     Ok(GateDecision::Allow)
                 } else {
@@ -303,3 +373,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 }
+
+    // ── Case sensitivity ──────────────────────────────────────────────────
+    //
+    // The comparison that matters in production runs on Windows, and a
+    // test that only runs on Windows is a test that only runs on the
+    // runner nobody looks at. So the CASE-INSENSITIVE variant is pinned
+    // here, on every platform, and the platform's own rule is asserted
+    // separately.
+
+    #[test]
+    fn case_insensitive_prefix_matches_differently_cased_paths() {
+        use std::path::Path;
+        assert!(path_starts_with_ignoring_case(
+            Path::new("c:/users/me/documents/notes.txt"),
+            Path::new("C:/Users/Me/Documents")
+        ));
+        assert!(path_starts_with_ignoring_case(
+            Path::new("C:/Users/Me/Documents"),
+            Path::new("c:/users/me/documents")
+        ));
+        // A different directory is still a different directory.
+        assert!(!path_starts_with_ignoring_case(
+            Path::new("C:/Users/Someone/Documents"),
+            Path::new("C:/Users/Me/Documents")
+        ));
+        // The exact path is inside.
+        assert!(path_starts_with_ignoring_case(
+            Path::new("C:/Users/Me/Documents/notes.txt"),
+            Path::new("C:/Users/Me/Documents")
+        ));
+    }
+
+    #[test]
+    fn case_insensitive_prefix_never_matches_a_partial_component() {
+        use std::path::Path;
+        // `/srv/data` must NOT cover `/srv/database`: a partial component
+        // match would WIDEN the grant, which is the dangerous direction.
+        assert!(!path_starts_with_ignoring_case(
+            Path::new("/srv/database/secret.txt"),
+            Path::new("/srv/data")
+        ));
+        assert!(path_starts_with_ignoring_case(
+            Path::new("/srv/data/ok.txt"),
+            Path::new("/srv/data")
+        ));
+    }
+
+    #[test]
+    fn case_insensitive_prefix_requires_the_whole_prefix() {
+        use std::path::Path;
+        // A path that does not even start with the prefix.
+        assert!(!path_starts_with_ignoring_case(
+            Path::new("/var/log/app.log"),
+            Path::new("/srv/data")
+        ));
+        // The path IS the prefix.
+        assert!(path_starts_with_ignoring_case(
+            Path::new("/srv/data"),
+            Path::new("/srv/data")
+        ));
+        // A prefix that is longer than the path.
+        assert!(!path_starts_with_ignoring_case(
+            Path::new("/srv"),
+            Path::new("/srv/data")
+        ));
+    }
+
+    #[test]
+    fn the_platform_rule_is_the_one_the_filesystem_has() {
+        use std::path::Path;
+        let granted = Path::new("/srv/data");
+        let spelled_differently = Path::new("/SRV/data");
+        if cfg!(windows) {
+            // The filesystem ignores case: the grant must survive it.
+            assert!(path_starts_with(spelled_differently, granted));
+            assert!(paths_equal(spelled_differently, granted));
+        } else {
+            // The filesystem does NOT ignore case: pretending it does
+            // would widen the grant.
+            assert!(!path_starts_with(spelled_differently, granted));
+            assert!(!paths_equal(spelled_differently, granted));
+        }
+    }
+
+    #[test]
+    fn one_shot_consent_survives_a_different_spelling_on_windows() {
+        use std::path::Path;
+        // The one-shot approval is for ONE path. On Windows the same file
+        // can be spelled with a different case, and the approval must
+        // still cover it — otherwise the approval is a one-shot that
+        // fires at random.
+        let approved = Path::new("C:/Users/Me/notes.txt");
+        let spelled = Path::new("c:/users/me/NOTES.txt");
+        if cfg!(windows) {
+            assert!(paths_equal(spelled, approved));
+        } else {
+            assert!(!paths_equal(spelled, approved));
+        }
+    }

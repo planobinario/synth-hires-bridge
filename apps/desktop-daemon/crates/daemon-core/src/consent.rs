@@ -14,6 +14,28 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
+/// How long the daemon waits for a consent answer before it abandons the
+/// action.
+///
+/// ── Why this number is not a local decision ─────────────────────────────
+///
+/// The web's cockpit kept a consent prompt on screen for THREE MINUTES
+/// while the daemon gave up after TWO. The owner could approve in the
+/// third minute and the approval was silently dropped — the prompt was
+/// still visible, so it looked like it was working. The two numbers
+/// lived in two repositories and nobody compared them.
+///
+/// The daemon now DECLARES this value in its hello frame
+/// (`consent_timeout_ms`) and the web honours it, so the prompt's
+/// lifetime and the daemon's lifetime are the same number by
+/// construction. The web keeps 180 s as its own default for daemons
+/// that predate the field.
+///
+/// Three minutes is the deliberate choice: it is long enough for an
+/// owner who walked away to come back, and short enough that a prompt
+/// nobody answers does not sit on the screen forever.
+pub const CONSENT_TIMEOUT_MS: u64 = 180_000;
+
 #[derive(Debug, Clone)]
 pub struct ConsentPrompt {
     pub action_id: String,
@@ -284,5 +306,37 @@ mod tests {
         // Even a denied answer wakes the parked action.
         let woke = notif_rx.try_recv().expect("notifier should wake even on deny");
         assert_eq!(woke.1.approved, false);
+    }
+
+    /// The consent timeout is a CROSS-REPO number.
+    ///
+    /// The web's cockpit must not outlive the daemon's patience: the
+    /// owner used to be able to approve a prompt the daemon had already
+    /// abandoned, and the approval was dropped in silence. The daemon
+    /// declares the value in its hello frame and the web honours it
+    /// (`consentTimeoutFor` in the web's bridge-protocol.ts), and BOTH
+    /// sides pin this number: the web's test asserts its own default is
+    /// 180 000, and this one asserts the daemon's constant is too.
+    ///
+    /// If one of them moves, a test on the other side goes red.
+    #[test]
+    fn consent_timeout_is_three_minutes_and_the_web_agrees() {
+        assert_eq!(CONSENT_TIMEOUT_MS, 180_000);
+        // The web's default, in `bridge-protocol.ts`:
+        // `export const CONSENT_TIMEOUT_DEFAULT_MS = 180_000`.
+        assert_eq!(CONSENT_TIMEOUT_MS / 1000, 180);
+    }
+
+    #[test]
+    fn a_prompt_that_is_never_answered_is_swept_after_the_timeout() {
+        // The sweep itself lives in the WS client (it needs the clock),
+        // but the INVARIANT it protects is here: the broker holds a
+        // prompt until it is answered, and the sweep releases it.
+        let broker = ConsentBroker::new();
+        let _rx = broker.ask(make_prompt("action_sweep"));
+        assert_eq!(broker.pending().len(), 1);
+        // Answering resolves it and removes it from the pending list.
+        assert!(broker.answer("action_sweep", ConsentAnswer { approved: false, remember: false }));
+        assert_eq!(broker.pending().len(), 0);
     }
 }

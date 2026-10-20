@@ -60,6 +60,20 @@ pub struct HelloFrame {
     /// BRIDGE_FEATURES (src/lib/agent/bridge-protocol.ts).
     #[serde(default)]
     pub features: Vec<String>,
+    /// How long this daemon waits for a consent answer before it abandons
+    /// the action.
+    ///
+    /// The web used to keep a consent prompt visible for THREE MINUTES
+    /// while the daemon gave up after TWO. The owner could click "approve"
+    /// in the third minute and the approval was silently dropped — the
+    /// prompt was still on screen, so it LOOKED like it was working.
+    ///
+    /// The daemon now DECLARES its own timeout and the web honours it, so
+    /// the prompt's lifetime and the daemon's lifetime are the same
+    /// number by construction. serde-defaulted: a daemon that predates
+    /// this field declares nothing, and the web keeps its own default.
+    #[serde(default)]
+    pub consent_timeout_ms: u64,
     /// One-shot manifest of tools already on the user's machine (CLIs,
     /// language servers, debug adapters — daemon-core/tools_probe.rs).
     /// Protocol v1.1: serde-defaulted, older webs ignore it. Empty/missing

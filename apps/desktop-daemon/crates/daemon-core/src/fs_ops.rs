@@ -431,7 +431,19 @@ pub const HASHLINE_PREFIX: &str = " | ";
 /// Short content hash shown to the model: first 6 hex chars of SHA-256.
 /// Collisions at 24 bits are rare and harmless: a collision only widens
 /// the match candidates, and uniqueness is enforced per-target anyway.
+///
+/// The trailing CR is a TERMINATOR, not content: a file written on
+/// Windows ends every line with "\r\n", and the same text must hash the
+/// same on every platform — or an anchored edit on a CRLF file is
+/// refused as stale for a reason nobody can see.
+///
+/// The rule lives HERE, in the hash function, and not in the callers: a
+/// caller that forgets to strip the CR produces a hash that matches
+/// nothing. The web's `shortHash`
+/// (src/lib/agent/tools/contract/format.ts) and the cloud's Python do the
+/// same, so the three implementations cannot disagree.
 pub fn short_hash(line: &str) -> String {
+    let line = line.strip_suffix('\r').unwrap_or(line);
     let digest = sha2::Sha256::digest(line.as_bytes());
     hex::encode(&digest[..3])
 }
