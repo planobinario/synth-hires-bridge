@@ -40,7 +40,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libglib2.0-dev libgtk-3-dev libdbus-1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libayatana-appindicator3-dev libxdo-dev
       - name: cargo check
-        run: cargo check --bin synthhires-bridge
+        run: cargo check --bin synth-hires-bridge
       # CI debugging profile: `-C debuginfo=0` slashes the link-time RAM
       # peak of the test binaries; threads capped at 2.
       # NOTE on the ubuntu deaths (8 in a row): they land at RANDOM points
