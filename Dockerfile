@@ -36,10 +36,27 @@ RUN case "${TARGETARCH:-amd64}" in \
     chmod +x /tmp/synthhires-bridge
 
 FROM ubuntu:24.04
+# UID 1000 is ALREADY TAKEN in the base image: `ubuntu:24.04` ships an
+# `ubuntu` user with uid 1000, so `useradd -u 1000` dies with "useradd:
+# UID 1000 is not unique" and the whole image fails to build.
+#
+# The uid only has to be STABLE, not 1000: the daemon's state lives in
+# the named volume, and the image creates and chowns that volume itself.
+# So the bridge user takes the first free uid, and the volume is chowned
+# to it in the same layer.
+
+# The RUNTIME libraries the daemon links against. The binary is a GUI
+# program with a headless mode, so it still links GTK, GLib and libxdo
+# even when it never opens a window — without them the container dies
+# with "error while loading shared libraries: libxdo.so.3" before the
+# daemon ever starts. (The CI's build dependencies are a different list:
+# those compile the daemon, these run it.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates dbus libssl3 \
+      libglib2.0-0 libgtk-3-0 libxdo3 \
   && rm -rf /var/lib/apt/lists/* \
-  && useradd -m -u 1000 bridge
+  && BRIDGE_UID="$(getent passwd 1000 >/dev/null && echo 1001 || echo 1000)" \
+  && useradd -m -u "$BRIDGE_UID" bridge
 COPY --from=fetch /tmp/synthhires-bridge /usr/local/bin/synthhires-bridge
 # HOME=/data: the daemon stores state.json + log under the user config dir,
 # so a single volume persists pairing across restarts on any feature set.
