@@ -458,12 +458,19 @@ async fn background_daemon_task(
                     use interprocess::local_socket::prelude::*;
                     use std::io::Write;
 
+                    // The path is bound OUTSIDE the `if`: `to_fs_name`
+                    // returns a value that borrows from the String, and
+                    // a temporary — or a binding that dies with the
+                    // branch — would be dropped while it is still in use
+                    // (E0716). The path is platform-neutral, so
+                    // computing it on Windows costs nothing.
+                    let ipc_path = ipc_socket_path();
                     let name = if cfg!(windows) {
                         "synthhires-bridge-ipc"
                             .to_ns_name::<interprocess::local_socket::GenericNamespaced>()
                             .unwrap()
                     } else {
-                        ipc_socket_path()
+                        ipc_path
                             .as_str()
                             .to_fs_name::<interprocess::local_socket::GenericFilePath>()
                             .unwrap()
@@ -479,12 +486,19 @@ async fn background_daemon_task(
                 } else {
                     use interprocess::local_socket::prelude::*;
                     use std::io::Write;
+                    // The path is bound OUTSIDE the `if`: `to_fs_name`
+                    // returns a value that borrows from the String, and
+                    // a temporary — or a binding that dies with the
+                    // branch — would be dropped while it is still in use
+                    // (E0716). The path is platform-neutral, so
+                    // computing it on Windows costs nothing.
+                    let ipc_path = ipc_socket_path();
                     let name = if cfg!(windows) {
                         "synthhires-bridge-ipc"
                             .to_ns_name::<interprocess::local_socket::GenericNamespaced>()
                             .unwrap()
                     } else {
-                        ipc_socket_path()
+                        ipc_path
                             .as_str()
                             .to_fs_name::<interprocess::local_socket::GenericFilePath>()
                             .unwrap()
