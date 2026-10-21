@@ -54,3 +54,11 @@ os = ["dep:atspi", "dep:zbus"]
 name = "daemon_core"
 path = "src/lib.rs"
 crate-type = ["lib", "cdylib"]
+
+# This integration test drives a real Chromium over CDP: chromiumoxide is
+# optional and OFF by default (the `browser` feature), so the target must
+# declare it — otherwise plain `cargo test -p daemon-core` fails to COMPILE
+# the target and takes every other test down with it.
+[[test]]
+name = "browser_live"
+required-features = ["browser"]
