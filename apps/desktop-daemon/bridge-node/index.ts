@@ -65,6 +65,21 @@ export class LocalBridgeDaemon {
         FOREIGN KEY(conversation_id) REFERENCES local_conversations(id) ON DELETE CASCADE
       );
 
+      CREATE TABLE IF NOT EXISTS local_artifacts (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT,
+        title TEXT,
+        kind TEXT,
+        content TEXT DEFAULT '',
+        updated_at INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS local_projects (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        description TEXT,
+        updated_at INTEGER
+      );
+
       CREATE TABLE IF NOT EXISTS action_audit_logs (
         id TEXT PRIMARY KEY,
         capability TEXT,
@@ -299,6 +314,36 @@ export class LocalBridgeDaemon {
 
 // CLI runner entrypoint if executed directly
 if (require.main === module) {
+  // ─────────────────────────────────────────────────────────────────────────
+  // REFERENCE IMPLEMENTATION — NOT A SHIPPED DAEMON.
+  //
+  // This file is a PROTOTYPE kept for protocol reference. It has NO
+  // capability gate, NO path checks and NO consent flow: `desktop.shell
+  // .execute` runs `exec(command)` and `desktop.fs.read`/`write` touch
+  // whatever path the frame asks for. The Rust daemon
+  // (crates/daemon-core) is the one that implements the real boundary —
+  // CapabilityGate, path_gate with symlink-escape checks, the consent
+  // broker and the encrypted audit log.
+  //
+  // Running this against a real backend would hand the account a device
+  // with full, unprompted access to the machine. It therefore REFUSES to
+  // start unless the operator opts in explicitly.
+  // ─────────────────────────────────────────────────────────────────────────
+  if (process.env.SYNTHHIRES_ALLOW_UNSAFE_REFERENCE_DAEMON !== "1") {
+    console.error(
+      "bridge-node is a REFERENCE prototype with no capability gate, no path " +
+        "checks and no consent flow.\n" +
+        "It refuses to start. Use the Rust daemon (crates/daemon-core).\n" +
+        "If you really know what you are doing, set " +
+        "SYNTHHIRES_ALLOW_UNSAFE_REFERENCE_DAEMON=1.",
+    )
+    process.exit(1)
+  }
+  console.warn(
+    "[bridge-node] WARNING: running the UNSAFE reference daemon — no capability " +
+      "gate, no path checks, no consent.",
+  )
+
   const backendUrl = process.env.SYNTHHIRES_BACKEND_URL || "https://synthhires.com"
   const deviceToken = process.env.SYNTHHIRES_DEVICE_TOKEN || "demo-token"
   const deviceId = process.env.SYNTHHIRES_DEVICE_ID || "dev-" + crypto.randomUUID().slice(0, 8)
