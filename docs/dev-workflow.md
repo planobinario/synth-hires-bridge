@@ -1,61 +1,50 @@
-# Dev Workflow — SynthHires Bridge
+# Dev Workflow — synth-hires-bridge
 
-## ⚠️ Mandatory: `npm run build` after editing worker.ts
+> Source of truth for build/verify/release rules:
+> [`apps/desktop-daemon/AGENTS.md`](apps/desktop-daemon/AGENTS.md).
+> This file is a shim so deep links and old habits land somewhere true.
 
-**Symptom**: Edits to `src/worker.ts` (consent-relay handler, API routes, DO
-classes) have **no effect** in development until you rebuild the Astro output.
+## The one rule
 
-**Root cause**: `wrangler.json` mounts `dist/_worker.js` as the Worker entry
-point. Astro's dev server (`astro dev`, port 4323) does **not** hot-reload
-into `dist/_worker.js`. The `main` field in `wrangler.toml` only affects
-Durable Object class bindings — API HTTP routes are delegated to the
-stale `dist/_worker.js`.
+**Compile and validate via GitHub Actions (`ci.yml`, `build.yml`) — not
+locally.** This machine's local Rust toolchain has a history of cache
+corruption / rustc ICE (notably a stack overflow compiling the full
+workspace with egui). Runners are clean; CI is the verdict.
 
-**Fix**:
-
-```bash
-# After ANY change to src/worker.ts (or the Astro integration that
-# generates _worker.js):
-cd apps/synth-hires        # web repo root
-npm run build              # regenerates dist/_worker.js
-```
-
-**Verification**:
-```bash
-# The worker log should show timestamps matching your build, not the
-# 00:48 stale artifact:
-ls -la dist/_worker.js
-```
-
-## inotify hot-reload limitations
-
-The systemd unit's `inotify` watch on `src/worker.ts` does **not**
-reliably trigger an Astro rebuild during `astro dev` + `wrangler dev`.
-In tests, **0 reloads were detected** after editing `worker.ts` — the
-only signal that changes took effect was an explicit `npm run build`.
-
-**Recommendation**: Disable the systemd inotify trigger for `worker.ts`
-or route it to `npm run build && wrangler dev` explicitly.
-
-## Daemon-side dev
-
-The Rust daemon (`apps/desktop-daemon/crates/`) hot-rebuilds via `cargo
-build` or `cargo watch -x build`. No Astro rebuild is needed for daemon
-crates; `cargo test` is the verification gate.
-
-## Running tests
+## Allowed local checks (fast, no egui)
 
 ```bash
-# Rust unit tests (daemon-core + daemon-cli)
 cd apps/desktop-daemon
-cargo test --workspace --lib
-
-# Consent broker unit tests only
-cargo test --package daemon-core --lib consent::tests
-
-# Server host-guard unit tests only
-cargo test --package daemon-cli --lib server::tests
-
-# Full E2E (real infra)
-bash apps/desktop-daemon/e2e/full-pipeline.sh
+cargo check -p daemon-protocol -p daemon-core --all-features
+cargo clippy -p daemon-protocol -p daemon-core --all-features -- -D warnings
+cargo test -p daemon-protocol -p daemon-core
 ```
+
+The full-workspace check (`cargo check --workspace`) may crash rustc
+locally — known toolchain issue, not a code bug. Never "fix" code to
+appease a local-only ICE; check CI first.
+
+Nix users: `nix build -L` + `nix flake check` exercise the flake,
+including `cargo test -p daemon-protocol -p daemon-core` inside the
+sandbox.
+
+## Release flow (summary — details in AGENTS.md)
+
+1. Bump `apps/desktop-daemon/Cargo.toml` (+ `Cargo.lock` via Cargo).
+2. Push to `main` → CI rebuilds the rolling **`edge`** release (what the
+   web serves at `/api/downloads/desktop` — no web-side change needed).
+3. Optional pinned release: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+## Repo layout reminder
+
+- `apps/desktop-daemon/crates/daemon-protocol` — wire format (lockstep
+  with the web's `src/lib/agent/bridge-protocol.ts` in the **other** repo).
+- `apps/desktop-daemon/crates/daemon-core` — pairing, WS client,
+  capability gate, fs/shell/proc/browser/dap/mcp ops.
+- `apps/desktop-daemon/crates/daemon-cli` — egui GUI + headless CLI +
+  loopback pairing server (`127.0.0.1:7333`).
+- Root `flake.nix` / `install.sh` / `Dockerfile` / `docs/install.md` —
+  the install matrix (NixOS is first-class via the flake module).
+- The web app lives in a SEPARATE repo (`synth-hires`). Never edit
+  daemon code there; never edit web code here. Protocol changes ship
+  in lockstep on both sides.

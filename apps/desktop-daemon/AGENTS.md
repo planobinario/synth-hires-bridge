@@ -29,27 +29,38 @@ overflow — es un problema del toolchain local; el CI compila bien.
      nuevo queda disponible automáticamente, sin tocar nada en la web.
 4. Opcional — release versionada (para descargas fijadas/manuales):
    `git tag vX.Y.Z && git push origin vX.Y.Z`
-   - `build.yml` compila los 6 binarios (win x64, linux x64/arm64, macos
-     x64/arm64) y crea/actualiza el release `vX.Y.Z` con los assets.
+   - `build.yml` compila 6 artefactos intermedios (win x64 user/system,
+     linux x64/arm64, macos x64/arm64 → lipo universal) y crea/actualiza
+     el release `vX.Y.Z` con los assets.
 
 ### Nombres de asset
 
-La web espera estos nombres en el release `edge`:
+La web espera estos nombres en el release `edge`
+(vía `/api/downloads/desktop`):
 
-- `synthhires-bridge-windows.exe`
-- `synthhires-bridge-linux`
-- `synthhires-bridge-macos`
-- `synthhires-bridge-nixos`
+- `synthhires-bridge-windows.exe` (alias de `-windows-x64-user.exe`)
+- `synthhires-bridge-linux` (alias de `-linux-x64`)
+- `synthhires-bridge-macos` (universal lipo x64+arm64)
+- `synthhires-bridge-nixos` (binario de store — SOLO usable vía nix;
+  `install.sh` aborta en NixOS a propósito)
 
-Los releases versionados (`v*`) añaden las variantes de arquitectura:
-`-x64` / `-arm64` (linux y macos) y `synthhires-bridge-nixos`. No renombrar los assets del release
-`edge`: la URL de descarga de la web los referencia directamente.
+El release `edge` también publica los nombres con arquitectura
+(`-windows-x64-user/system.exe`, `-linux-x64`, `-linux-arm64`) más
+paquetes (`.deb` x64/arm64, `.rpm` x64/arm64, `.AppImage` x64).
+`install.sh` usa los nombres con arch en Linux; la web usa los alias.
+No renombrar ni limpiar unos sin actualizar el otro consumidor.
+
+Nota de nombres: Cargo compila `synth-hires-bridge` (con guion,
+`[[bin]]` en `crates/daemon-cli/Cargo.toml`); releases / `install.sh` /
+Docker lo renombran a `synthhires-bridge` (sin guion). `flake.nix`
+`mainProgram` es `synth-hires-bridge` (`nix run` lo resuelve solo).
 
 ### Soporte NixOS / Nix Flakes
 El repo incluye `flake.nix` en la raíz. Puede ejecutarse directamente vía:
 `nix run github:planobinario/synth-hires-bridge`
-o añadirse como módulo systemd en NixOS (`services.synthhires-bridge.enable = true;`).
-El CI compila el Flake y publica el binario empaquetado `synthhires-bridge-nixos`.
+o añadirse como módulo systemd en NixOS (`services.synth-hires-bridge.enable = true;`).
+El CI compila el Flake (`nix build` + `nix flake check`) y publica el binario empaquetado `synthhires-bridge-nixos`.
+Opciones del módulo: `headless` (default true), `backendUrl`, `configDir`, `localPort`.
 
 ## Seguimiento del build
 
