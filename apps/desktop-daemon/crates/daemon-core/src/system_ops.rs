@@ -240,6 +240,17 @@ pub async fn fetch_network(req: NetworkFetchRequest) -> Result<NetworkFetchResul
             "only http and https are supported".into(),
         ));
     }
+    // Cloud metadata SSRF guard: the daemon runs with the USER's cloud
+    // credentials nearby (~/aws, gcloud, az). A compromised server must
+    // not turn network.fetch into an IMDS credential oracle. Loopback and
+    // RFC1918 stay allowed (local dev servers are a legitimate use) —
+    // documented limitation: DNS-rebinding a public name to 169.254.x
+    // is NOT resolved/checked here (no blocking DNS in the hot path).
+    if is_cloud_metadata_host(parsed.host_str().unwrap_or("")) {
+        return Err(DaemonError::Protocol(
+            "cloud metadata endpoints are blocked".into(),
+        ));
+    }
 
     let timeout_ms = req.timeout_ms.unwrap_or(30_000).clamp(100, 120_000);
     let max_bytes = req
@@ -305,6 +316,25 @@ pub async fn fetch_network(req: NetworkFetchRequest) -> Result<NetworkFetchResul
     })
 }
 
+/// Cloud instance-metadata hosts: credential oracles, never fetch targets.
+fn is_cloud_metadata_host(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    // Strip brackets (IPv6) and trailing dot (FQDN form).
+    let h = h.trim_start_matches('[').trim_end_matches(']');
+    let h = h.trim_end_matches('.');
+    matches!(
+        h,
+        // AWS / GCP / Azure / Oracle / DigitalOcean link-local metadata.
+        "169.254.169.254" | "fd00:ec2::254"
+        // Alibaba Cloud metadata.
+        | "100.100.100.200"
+        // GCP metadata DNS name.
+        | "metadata.google.internal"
+        // Azure wired-server / platform endpoints reachable link-local.
+        | "168.63.129.16"
+    )
+}
+
 pub async fn watch_filesystem(req: FsWatchRequest) -> Result<FsWatchResult> {
     let duration_ms = req
         .duration_ms
@@ -358,4 +388,28 @@ pub async fn watch_filesystem(req: FsWatchRequest) -> Result<FsWatchResult> {
     })
     .await
     .map_err(|e| DaemonError::Protocol(format!("watch task: {e}")))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_cloud_metadata_host;
+
+    #[test]
+    fn metadata_hosts_blocked() {
+        assert!(is_cloud_metadata_host("169.254.169.254"));
+        assert!(is_cloud_metadata_host("100.100.100.200"));
+        assert!(is_cloud_metadata_host("metadata.google.internal"));
+        assert!(is_cloud_metadata_host("metadata.google.internal."));
+        assert!(is_cloud_metadata_host("168.63.129.16"));
+        assert!(is_cloud_metadata_host("[fd00:ec2::254]"));
+    }
+
+    #[test]
+    fn legitimate_hosts_allowed() {
+        assert!(!is_cloud_metadata_host("127.0.0.1"));
+        assert!(!is_cloud_metadata_host("localhost"));
+        assert!(!is_cloud_metadata_host("192.168.1.10"));
+        assert!(!is_cloud_metadata_host("synthhires.com"));
+        assert!(!is_cloud_metadata_host("registry.npmjs.org"));
+    }
 }

@@ -243,6 +243,17 @@ impl<'a> GitOps<'a> {
         let root = gate_repo(self.gate, &req.path).await?;
         let max_files = req.max_files.unwrap_or(40).clamp(1, 200);
         let target = req.target.unwrap_or_else(|| "unstaged".to_string());
+        // Flag-injection guard: `target` becomes a git argv. A leading `-`
+        // (e.g. `--output=/tmp/pwned`, `--upload-pack=evil`) would parse as
+        // a git flag and escape the read-only diff path (arbitrary write
+        // via `git diff --output`, bypassing the fs.write gate entirely).
+        // Legit targets (HEAD, main..feat, SHAs, branch names) never start
+        // with `-`. The fixed vocabulary below is allowlisted verbatim.
+        if target.starts_with('-') || target.chars().any(|c| c.is_control() || c == '\0') {
+            return Err(crate::DaemonError::Protocol(format!(
+                "git diff: invalid target {target:?}"
+            )));
+        }
 
         let stat_args: Vec<&str> = match target.as_str() {
             "staged" | "--cached" => vec!["diff", "--cached", "--numstat"],
