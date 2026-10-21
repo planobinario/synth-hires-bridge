@@ -339,6 +339,72 @@ pub fn parse_chat_push_params(
     Ok(out)
 }
 
+// ── Sync payloads: artifacts + projects (opt-in, backwards compatible) ──
+//
+// The web pushes these alongside conversations when the user enables sync.
+// All fields defaulted so old daemons ignore them and old pushes (without
+// these arrays) still parse. New daemons persist them in ChatStore v2.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatSyncArtifact {
+    pub id: String,
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub updated_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatSyncProject {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatSyncExtra {
+    #[serde(default)]
+    pub artifacts: Vec<ChatSyncArtifact>,
+    #[serde(default)]
+    pub projects: Vec<ChatSyncProject>,
+}
+
+/// Parse optional `artifacts` / `projects` arrays from the same params bag.
+/// Missing arrays => empty (old web pushes still parse).
+pub fn parse_chat_push_extra(params: &serde_json::Value) -> Result<ChatSyncExtra, String> {
+    let mut extra = ChatSyncExtra::default();
+    if let Some(arr) = params.get("artifacts").and_then(|v| v.as_array()) {
+        for a in arr {
+            match serde_json::from_value::<ChatSyncArtifact>(a.clone()) {
+                Ok(item) => extra.artifacts.push(item),
+                Err(e) => return Err(format!("invalid artifact entry: {e}")),
+            }
+        }
+    }
+    if let Some(arr) = params.get("projects").and_then(|v| v.as_array()) {
+        for p in arr {
+            match serde_json::from_value::<ChatSyncProject>(p.clone()) {
+                Ok(item) => extra.projects.push(item),
+                Err(e) => return Err(format!("invalid project entry: {e}")),
+            }
+        }
+    }
+    Ok(extra)
+}
+
 /// Generate a 6-char pairing code (30 bits of entropy). MUST match
 /// the algorithm in `src/lib/agent/bridge-codes.ts → toBase32`.
 pub fn generate_pairing_code() -> String {

@@ -13,12 +13,12 @@
 //! Conflict resolution: last-write-wins on `updated_at`, mirroring
 //! the web app's `/api/sync/delta` semantics.
 
-use daemon_protocol::{ChatSyncConversation, ChatSyncMessage};
+use daemon_protocol::{ChatSyncArtifact, ChatSyncConversation, ChatSyncMessage, ChatSyncProject};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-const _SCHEMA_VERSION: i64 = 1;
+const _SCHEMA_VERSION: i64 = 2;
 
 pub struct ChatStore {
     conn: Mutex<Connection>,
@@ -93,6 +93,32 @@ impl ChatStore {
             .optional()
             .map_err(|e| format!("read version: {e}"))?;
 
+        // v2 adds opt-in sync tables (artifacts + projects). Runs after v1
+        // so existing chats.db files migrate without data loss.
+        if current.unwrap_or(0) < 2 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS local_artifacts (
+                    id TEXT PRIMARY KEY,
+                    conversation_id TEXT,
+                    title TEXT,
+                    kind TEXT,
+                    content TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_artifacts_conv ON local_artifacts(conversation_id, updated_at);
+                CREATE TABLE IF NOT EXISTS local_projects (
+                    id TEXT PRIMARY KEY,
+                    name TEXT,
+                    description TEXT,
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO schema_meta (key, value) VALUES ('schema_version', 2)
+                  ON CONFLICT(key) DO UPDATE SET value = MAX(value, 2);
+                "#,
+            )
+            .map_err(|e| format!("v2 migration: {e}"))?;
+        }
         if current.unwrap_or(0) < 1 {
             conn.execute_batch(
                 r#"
@@ -327,6 +353,55 @@ impl ChatStore {
         let conn = self.conn.lock().map_err(|e| format!("lock: {e}"))?;
         conn.query_row("SELECT count(*) FROM local_messages", [], |r| r.get(0))
             .map_err(|e| format!("count msgs: {e}"))
+    }
+
+    /// Upsert an artifact snapshot (LWW on updated_at, content capped at 200k chars).
+    pub fn upsert_artifact(&self, a: &ChatSyncArtifact) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| format!("lock: {e}"))?;
+        let updated_at = a.updated_at.unwrap_or(0) as i64;
+        let existing: Option<i64> = conn
+            .query_row("SELECT updated_at FROM local_artifacts WHERE id = ?1", [&a.id], |r| r.get(0))
+            .optional()
+            .map_err(|e| format!("read artifact: {e}"))?;
+        if let Some(cur) = existing {
+            if cur > updated_at {
+                return Ok(());
+            }
+        }
+        let content: String = a.content.chars().take(200_000).collect();
+        conn.execute(
+            r#"INSERT INTO local_artifacts (id, conversation_id, title, kind, content, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+               ON CONFLICT(id) DO UPDATE SET conversation_id=excluded.conversation_id, title=excluded.title,
+               kind=excluded.kind, content=excluded.content, updated_at=excluded.updated_at"#,
+            params![a.id, a.conversation_id, a.title, a.kind, content, updated_at],
+        )
+        .map_err(|e| format!("upsert artifact: {e}"))?;
+        Ok(())
+    }
+
+    /// Upsert a project snapshot (LWW on updated_at).
+    pub fn upsert_project(&self, p: &ChatSyncProject) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| format!("lock: {e}"))?;
+        let updated_at = p.updated_at.unwrap_or(0) as i64;
+        let existing: Option<i64> = conn
+            .query_row("SELECT updated_at FROM local_projects WHERE id = ?1", [&p.id], |r| r.get(0))
+            .optional()
+            .map_err(|e| format!("read project: {e}"))?;
+        if let Some(cur) = existing {
+            if cur > updated_at {
+                return Ok(());
+            }
+        }
+        conn.execute(
+            r#"INSERT INTO local_projects (id, name, description, updated_at)
+               VALUES (?1, ?2, ?3, ?4)
+               ON CONFLICT(id) DO UPDATE SET name=excluded.name,
+               description=excluded.description, updated_at=excluded.updated_at"#,
+            params![p.id, p.name, p.description, updated_at],
+        )
+        .map_err(|e| format!("upsert project: {e}"))?;
+        Ok(())
     }
 
     pub fn delete_conversation(&self, id: &str) -> Result<bool, String> {

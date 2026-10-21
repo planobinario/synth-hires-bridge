@@ -1215,11 +1215,21 @@ impl WsClient {
                     request.params.clone(),
                 );
                 match parsed {
-                    Ok(value) => {
-                        let gate = self.gate.lock().await.clone();
-                        let result = crate::fs_ops::FsOps::new(&gate).verify(value).await;
-                        self.send_action_result(ws, request.id, result.exists && result.readable && result.writable, Some(serde_json::json!({"exists": result.exists, "is_dir": result.is_dir, "readable": result.readable, "writable": result.writable})), result.error, elapsed_ms(started)).await
-                    }
+                    // Verify PROBES WRITES (probe file + read-back): it must
+                    // pass the same path gate as a write, never run blind.
+                    // Deny on traversal (check_path Deny) surfaces here as
+                    // capability_denied instead of an oracle over /etc.
+                    Ok(value) => match self
+                        .path_gate(ws, &request, "desktop.fs.verify", &value.path, decision)
+                        .await
+                    {
+                        Ok(gate) => {
+                            let result = crate::fs_ops::FsOps::new(&gate).verify(value).await;
+                            self.send_action_result(ws, request.id, result.exists && result.readable && result.writable, Some(serde_json::json!({"exists": result.exists, "is_dir": result.is_dir, "readable": result.readable, "writable": result.writable})), result.error, elapsed_ms(started)).await
+                        }
+                        Err(DaemonError::AwaitingConsent) => Err(DaemonError::AwaitingConsent),
+                        Err(error) => self.send_error(ws, request.id, error.to_string()).await,
+                    },
                     Err(error) => {
                         self.send_error(ws, request.id, format!("bad params: {error}"))
                             .await
@@ -1227,9 +1237,20 @@ impl WsClient {
                 }
             }
             "desktop.fs.list" => {
+                // Listing is enumeration: gate the listed dir itself. An
+                // empty/absent path lists the allowed ROOTS only (no disk
+                // touch outside the gate's own constants).
                 dispatch_op!(self, ws, request, started, value, req, crate::fs_ops::FsListRequest, {
-                    let gate = self.gate.lock().await.clone();
-                    crate::fs_ops::FsOps::new(&gate).list(value).await
+                    let target = value.path.as_deref().unwrap_or("").trim().to_string();
+                    if target.is_empty() {
+                        let gate = self.gate.lock().await.clone();
+                        crate::fs_ops::FsOps::new(&gate).list(value).await
+                    } else {
+                        let gate = self
+                            .path_gate(ws, req, "desktop.fs.list", std::path::Path::new(&target), decision)
+                            .await?;
+                        crate::fs_ops::FsOps::new(&gate).list(value).await
+                    }
                 })
             }
             "desktop.fs.watch" => {
@@ -1497,9 +1518,15 @@ impl WsClient {
     /// the egui UI was open — the ConsentBroker existed but nobody called
     /// `ask()`, so real users saw every out-of-workspace action fail. Now:
     /// the broker raises the prompt, the UI shows it, and the action waits
-    /// (bounded) for the user's answer. Server pre-approved actions
-    /// (`skip_consent_prompt`, validated against the owner's DB grants)
-    /// skip the dialog by design — that flag IS the consent.
+    /// (bounded) for the user's answer.
+    ///
+    /// Server pre-approval (`skip_consent_prompt`) is HONEST but not BLIND:
+    /// the flag only skips the dialog when the LOCAL gate independently
+    /// resolves the real path to Allow (i.e. the server's claim matches
+    /// this machine's grants). A skip for a path outside the local
+    /// alwaysAllowPaths falls through to the normal consent flow instead
+    /// of silently widening disk access — a compromised server (or a stale
+    /// DB grant) cannot write where the owner never granted.
     async fn path_gate(
         &self,
         ws: &mut WsStream,
@@ -1511,14 +1538,28 @@ impl WsClient {
         if !self.gate.lock().await.allows(capability) {
             return Err(DaemonError::CapabilityDenied(capability.into()));
         }
-        // Server-side consent: the action route already validated the target
-        // against the device's alwaysAllowPaths in the owner's DB. Trust it.
+        // Server-side consent: only honoured when the LOCAL gate agrees.
+        // The action route validated the target against the device's
+        // alwaysAllowPaths in the owner's DB — but the daemon is the last
+        // line of defense, and the local snapshot is authoritative for
+        // THIS disk. Mismatch → fall through to interactive consent.
         if request.skip_consent_prompt {
-            return Ok(self
-                .gate
-                .lock()
-                .await
-                .with_additional_path(path.to_path_buf()));
+            let local_verdict = self.gate.lock().await.check_path_real(capability, path);
+            if matches!(
+                local_verdict,
+                Ok(crate::capability::GateDecision::Allow)
+            ) {
+                return Ok(self
+                    .gate
+                    .lock()
+                    .await
+                    .with_additional_path(path.to_path_buf()));
+            }
+            tracing::warn!(
+                capability = %capability,
+                path = %path.display(),
+                "skip_consent_prompt for path outside local grants — requiring interactive consent"
+            );
         }
         // A previous "remember" may have persisted this path into the local
         // gate (or the owner granted it live via scope_update). Without this
@@ -1637,24 +1678,38 @@ impl WsClient {
         Ok(())
     }
 
+    /// Append-only local audit trail. Params are REDACTED before hitting
+    /// disk: file contents, eval code, shell commands' secrets, fetch
+    /// headers/bodies and tokens must never sit in plaintext next to the
+    /// config dir (the old code wrote full `PARAMS` JSON world-readable).
+    /// The encrypted `AuditLog` (audit.rs, AES-256-GCM) remains the store
+    /// of record for sensitive payloads; this line log keeps capability +
+    /// path/command SHAPE for debugging. File is 0600 on Unix.
     fn audit(&self, request: &daemon_protocol::ActionRequestFrame) {
         let config_dir = directories::ProjectDirs::from("com", "synthhires", "bridge")
             .map(|d| d.config_dir().to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from(".").join("synthhires-bridge"));
         let _ = std::fs::create_dir_all(&config_dir);
-        let params = serde_json::to_string(&request.params).unwrap_or_default();
+        let params = redact_audit_params(&request.params);
         let line = format!(
             "[{}] CAPABILITY: {} PARAMS: {}\n",
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
             request.capability,
             params
         );
-        if let Ok(mut file) = std::fs::OpenOptions::new()
+        let path = config_dir.join("audit.log");
+        if let Ok(file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(config_dir.join("audit.log"))
+            .open(&path)
         {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
             use std::io::Write;
+            let mut file = file;
             let _ = file.write_all(line.as_bytes());
         }
     }
@@ -1684,10 +1739,28 @@ impl WsClient {
                         .upsert_conversation(conversation)
                         .map_err(|e| DaemonError::Protocol(format!("store_error: {e}")))?;
                 }
+                // Opt-in extra: artifacts + projects (absent in old pushes => empty, no-op).
+                let mut extra_art = 0usize;
+                let mut extra_proj = 0usize;
+                match daemon_protocol::parse_chat_push_extra(&request.params) {
+                    Ok(extra) => {
+                        for a in &extra.artifacts {
+                            self.chat_store.upsert_artifact(a).map_err(|e| DaemonError::Protocol(format!("store_error: {e}")))?;
+                            extra_art += 1;
+                        }
+                        for p in &extra.projects {
+                            self.chat_store.upsert_project(p).map_err(|e| DaemonError::Protocol(format!("store_error: {e}")))?;
+                            extra_proj += 1;
+                        }
+                    }
+                    Err(e) => return self.send_error(ws, request.id, format!("bad_params: {e}")).await,
+                }
                 tracing::info!(
-                    "[chat-sync] pushed {} conversations, {} messages saved",
+                    "[chat-sync] pushed {} conversations, {} messages saved, {} artifacts, {} projects",
                     conversations.len(),
-                    saved
+                    saved,
+                    extra_art,
+                    extra_proj
                 );
                 (true, None)
             }
@@ -1747,6 +1820,74 @@ fn zombie_decision(connected: bool, consecutive_misses: u32) -> ZombieDecision {
     }
 }
 
+/// Redacts sensitive audit params: values under these keys are replaced,
+/// everything else is kept but truncated to 500 chars per string so the
+/// shape stays debuggable without persisting file contents or secrets.
+fn redact_audit_params(params: &serde_json::Value) -> String {
+    const SENSITIVE: &[&str] = &[
+        "content",
+        "content_base64",
+        "replacement",
+        "replacementcontent",
+        "targetcontent",
+        "code",
+        "command",
+        "token",
+        "password",
+        "secret",
+        "apikey",
+        "api_key",
+        "authorization",
+        "cookie",
+        "body",
+        "headers",
+        "stdout",
+        "stderr",
+        "output",
+        "diff",
+    ];
+    fn redact(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut out = serde_json::Map::with_capacity(map.len());
+                for (k, v) in map {
+                    let kl = k.to_ascii_lowercase().replace(['_', '-'], "");
+                    if SENSITIVE.iter().any(|s| kl == *s || kl.ends_with(s)) {
+                        out.insert(k.clone(), serde_json::Value::String("[redacted]".into()));
+                    } else {
+                        out.insert(k.clone(), redact(v));
+                    }
+                }
+                serde_json::Value::Object(out)
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(redact).collect())
+            }
+            serde_json::Value::String(s) => {
+                if s.len() > 500 {
+                    // Char-boundary-safe truncation (byte slicing panics on
+                    // multi-byte UTF-8).
+                    let cut = s
+                        .char_indices()
+                        .take_while(|(i, _)| *i < 500)
+                        .last()
+                        .map(|(i, c)| i + c.len_utf8())
+                        .unwrap_or(0);
+                    serde_json::Value::String(format!(
+                        "{}…[truncated {} chars]",
+                        s.get(..cut).unwrap_or(""),
+                        s.chars().count()
+                    ))
+                } else {
+                    value.clone()
+                }
+            }
+            _ => value.clone(),
+        }
+    }
+    serde_json::to_string(&redact(params)).unwrap_or_default()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ZombieDecision {
     connected: bool,
@@ -1763,22 +1904,90 @@ fn frame_heartbeat_t(frame: &BridgeFrame) -> u64 {
     }
 }
 
+/// Backstop blocklist for `desktop.shell.execute` — NOT a security
+/// boundary. Matching is case-insensitive substring on purpose (cheap,
+/// broad); bypasses exist for every static list (`rm${IFS}-rf`,
+/// `sudo\t`, …). The real controls are, in order: (1) the capability
+/// must be granted at pairing, (2) the destructive-command guard +
+/// consent flow on the web/owner side, (3) this list as a last-resort
+/// tripwire for the most obviously catastrophic shapes. Never weaken
+/// (1)/(2) because this list "covers" something.
 fn contains_dangerous_shell(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    // Normalise the two most common obfuscations so `rm${IFS}-rf /`
+    // still trips: strip ${IFS}/$IFS and collapse tabs to spaces.
+    let normalised = lower.replace("${ifs}", " ").replace("$ifs", " ").replace('\t', " ");
     [
         "sudo ",
+        "sudo\t",
         "rm -rf",
-        "del /f /s /q",
+        "rm -fr",
+        "rm --no-preserve-root",
+        "del /f",
+        "del /s",
+        "remove-item",
         "mkfs",
-        "chmod -R 777",
-        "chown -R",
+        "mkfs.",
+        "dd ",
+        "of=/dev/",
+        ":(){",
+        "chmod -r",
+        "chmod 777",
+        "chown -r",
+        "format c:",
+        "diskpart",
+        "shutdown ",
+        "powershell -enc",
+        "powershell -encodedcommand",
     ]
     .iter()
-    .any(|pattern| command.contains(pattern))
+    .any(|pattern| normalised.contains(pattern))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_redacts_contents_and_secrets() {
+        let params = serde_json::json!({
+            "path": "/home/u/workspace/main.rs",
+            "content": "SUPER_SECRET_FILE_BYTES",
+            "command": "deploy --token abc123",
+            "headers": {"Authorization": "Bearer xyz"},
+            "capability": "desktop.fs.write"
+        });
+        let redacted = redact_audit_params(&params);
+        assert!(redacted.contains("/home/u/workspace/main.rs"), "paths stay for debugging");
+        assert!(!redacted.contains("SUPER_SECRET_FILE_BYTES"));
+        assert!(!redacted.contains("abc123"));
+        assert!(!redacted.contains("Bearer xyz"));
+        assert!(redacted.contains("[redacted]"));
+    }
+
+    #[test]
+    fn dangerous_shell_backstop_blocks_variants() {
+        // Exactos históricos (compat).
+        assert!(contains_dangerous_shell("sudo rm -rf /"));
+        assert!(contains_dangerous_shell("rm -rf /tmp/x"));
+        assert!(contains_dangerous_shell("mkfs.ext4 /dev/sda1"));
+        assert!(contains_dangerous_shell("chmod -R 777 ."));
+        // Case-insensitive + variantes que antes pasaban.
+        assert!(contains_dangerous_shell("RM -RF /"));
+        assert!(contains_dangerous_shell("rm -Rf / --no-preserve-root"));
+        assert!(contains_dangerous_shell("rm --no-preserve-root -rf /home"));
+        assert!(contains_dangerous_shell("sudo\tapt update"));
+        assert!(contains_dangerous_shell("rm${IFS}-rf /"));
+        assert!(contains_dangerous_shell("dd if=/dev/zero of=/dev/sda bs=1M"));
+        assert!(contains_dangerous_shell(":(){ :|:& };:"));
+        assert!(contains_dangerous_shell("powershell Remove-Item -Recurse -Force C:\\"));
+        assert!(contains_dangerous_shell("del /f /s /q C:\\temp"));
+        assert!(contains_dangerous_shell("chmod 777 -R ."));
+        // Benignos: no falsos positivos en comandos de todos los días.
+        assert!(!contains_dangerous_shell("ls -la && cargo test"));
+        assert!(!contains_dangerous_shell("git status --short"));
+        assert!(!contains_dangerous_shell("echo done - all formatted"));
+    }
 
     #[test]
     fn zombie_requires_two_consecutive_misses() {
