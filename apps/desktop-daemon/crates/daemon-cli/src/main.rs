@@ -644,12 +644,16 @@ async fn background_daemon_task(
             use interprocess::local_socket::ListenerOptions;
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+            // Same rule as the other two sites: the path is bound
+            // OUTSIDE the `if`, because `to_fs_name` borrows from it and
+            // a binding that dies with the branch is not enough.
+            let ipc_path = ipc_socket_path();
             let name = if cfg!(windows) {
                 "synthhires-bridge-ipc"
                     .to_ns_name::<interprocess::local_socket::GenericNamespaced>()
                     .unwrap()
             } else {
-                ipc_socket_path()
+                ipc_path
                     .as_str()
                     .to_fs_name::<interprocess::local_socket::GenericFilePath>()
                     .unwrap()
