@@ -10,7 +10,7 @@ members = [
 version = "0.1.21"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/synthhires/bridge"
+repository = "https://github.com/planobinario/synth-hires-bridge"
 authors = ["SynthHires <[email protected]>"]
 rust-version = "1.74"
 
