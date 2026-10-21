@@ -7,6 +7,14 @@
 //! model can build state incrementally instead of re-bootstrapping a script
 //! every turn.
 //!
+//! Console frames are tagged with the SESSION that produced them, not only
+//! with the request that happened to be in flight: a session's console
+//! closure outlives any single request, so request-id routing silently
+//! discarded every log line after the call that created the session. Frames
+//! for a session that is not the one executing (fire-and-forget async work
+//! landing during another session's round-trip, or output written while
+//! idle) are queued per session and delivered on that session's next call.
+//!
 //! Threat model (honest): arbitrary JS with `require` is shell-equivalent
 //! power. The action is therefore gated by the `desktop.shell.execute` scope
 //! (the consent dialog the user already answers for terminal commands) and
@@ -53,13 +61,15 @@ pub struct EvalRequest {
 pub struct EvalResult {
     pub session_id: String,
     pub created_session: bool,
+    /// Captured console output for this session. Includes lines this session
+    /// produced earlier while idle (queued); never another session's —
+    /// console frames route by session, not by request id.
     pub stdout: String,
     pub stderr: String,
     /// The completion value of the last expression, JSON-serialized
     /// (promises are awaited by the runtime, up to 15s).
     pub result: Option<serde_json::Value>,
 }
-
 /// A JS runtime child process with its stdio pipes.
 struct Runtime {
     proc: Child,
@@ -67,10 +77,20 @@ struct Runtime {
     reader: BufReader<ChildStdout>,
 }
 
+/// Console output that arrived for a session other than the one executing
+/// (or while no exec was in flight). Held until that session's next call so
+/// its console stream never silently loses lines.
+#[derive(Debug, Default)]
+struct PendingOut {
+    stdout: String,
+    stderr: String,
+}
+
 struct EngineInner {
     gate: Arc<Mutex<CapabilityGate>>,
     runtime: Option<Runtime>,
     sessions: HashMap<String, Instant>,
+    pending: HashMap<String, PendingOut>,
 }
 
 /// Shared eval engine: spawns the runtime lazily and owns all sessions.
@@ -85,6 +105,7 @@ impl EvalEngine {
                 gate,
                 runtime: None,
                 sessions: HashMap::new(),
+                pending: HashMap::new(),
             })),
         }
     }
@@ -114,6 +135,7 @@ impl EvalEngine {
             .collect();
         for id in expired {
             inner.sessions.remove(&id);
+            inner.pending.remove(&id);
             let _ = Self::send_request(&mut inner, &serde_json::json!({
                 "id": uuid::Uuid::new_v4().to_string(),
                 "op": "destroy",
@@ -139,8 +161,12 @@ impl EvalEngine {
         .await?;
 
         let deadline = Instant::now() + EXEC_TIMEOUT;
-        let mut stdout = String::new();
-        let mut stderr = String::new();
+        // Output queued while this session was idle (logs from fire-and-forget
+        // async work, or lines that hit the pipe between calls) belongs to THIS
+        // session's stream: seed the buffers before reading the new frames.
+        let mut queued = inner.pending.remove(&session_id).unwrap_or_default();
+        let mut stdout = std::mem::take(&mut queued.stdout);
+        let mut stderr = std::mem::take(&mut queued.stderr);
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -148,6 +174,7 @@ impl EvalEngine {
                 // any other way, and a wedged process is untrustworthy.
                 Self::kill_runtime(&mut inner);
                 inner.sessions.clear();
+                inner.pending.clear();
                 return Err(DaemonError::Protocol(
                     "eval timeout: runtime killed and all sessions destroyed".into(),
                 ));
@@ -167,6 +194,7 @@ impl EvalEngine {
                     // read after the deadline branch — treated the same).
                     Self::kill_runtime(&mut inner);
                     inner.sessions.clear();
+                    inner.pending.clear();
                     return Err(DaemonError::Protocol(
                         "eval: runtime exited unexpectedly; sessions destroyed".into(),
                     ));
@@ -174,6 +202,7 @@ impl EvalEngine {
                 Ok(Err(e)) => {
                     Self::kill_runtime(&mut inner);
                     inner.sessions.clear();
+                    inner.pending.clear();
                     return Err(DaemonError::Protocol(format!(
                         "eval: runtime read error ({e}); sessions destroyed"
                     )));
@@ -184,13 +213,45 @@ impl EvalEngine {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if msg.get("id").and_then(|v| v.as_str()) != Some(request_id.as_str()) {
-                continue;
-            }
-            match msg.get("type").and_then(|v| v.as_str()).unwrap_or("") {
-                "stdout" => append_capped(&mut stdout, msg.get("data")),
-                "stderr" => append_capped(&mut stderr, msg.get("data")),
+            let msg_id = msg.get("id").and_then(|v| v.as_str());
+            let msg_session = msg.get("session").and_then(|v| v.as_str());
+            let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match msg_type {
+                // Console frames route by SESSION: the console closure of a
+                // session outlives the request that created it, so request-id
+                // filtering discarded every log line from call 2 onward (id
+                // mismatch → skip). The request id is only a fallback for
+                // frames from an older runtime that lacks the session tag.
+                "stdout" | "stderr" => {
+                    let data = msg.get("data");
+                    let mine = msg_session == Some(session_id.as_str())
+                        || (msg_session.is_none() && msg_id == Some(request_id.as_str()));
+                    if mine {
+                        if msg_type == "stdout" {
+                            append_capped(&mut stdout, data);
+                        } else {
+                            append_capped(&mut stderr, data);
+                        }
+                    } else if let Some(other) = msg_session {
+                        // Another session's straggler: queue it for that
+                        // session's next call. Never delivered to us, never
+                        // dropped while the session is alive, never leaked
+                        // into a session that has since been reaped.
+                        if inner.sessions.contains_key(other) {
+                            let slot = inner.pending.entry(other.to_string()).or_default();
+                            if msg_type == "stdout" {
+                                append_capped(&mut slot.stdout, data);
+                            } else {
+                                append_capped(&mut slot.stderr, data);
+                            }
+                        }
+                    }
+                }
                 "done" => {
+                    if msg_id != Some(request_id.as_str()) {
+                        // e.g. the reaper's fire-and-forget `destroy` reply.
+                        continue;
+                    }
                     let created =
                         msg.get("createdSession").and_then(|v| v.as_bool()).unwrap_or(false);
                     inner.sessions.insert(session_id.clone(), Instant::now());
@@ -203,6 +264,9 @@ impl EvalEngine {
                     });
                 }
                 "error" => {
+                    if msg_id != Some(request_id.as_str()) {
+                        continue;
+                    }
                     let created =
                         msg.get("createdSession").and_then(|v| v.as_bool()).unwrap_or(false);
                     inner.sessions.insert(session_id.clone(), Instant::now());
@@ -339,13 +403,17 @@ function serialize(v) {
   try { return JSON.parse(JSON.stringify(v)); } catch { return String(v); }
 }
 
-function makeConsole(id) {
-  return {
-    log: (...a) => send({ id, type: "stdout", data: a.map(fmt).join(" ") }),
-    info: (...a) => send({ id, type: "stdout", data: a.map(fmt).join(" ") }),
-    warn: (...a) => send({ id, type: "stderr", data: a.map(fmt).join(" ") }),
-    error: (...a) => send({ id, type: "stderr", data: a.map(fmt).join(" ") }),
+// Session id → { ctx, currentId }. `currentId` is the request in flight for
+// this session; console frames carry the session tag (the routing key on the
+// Rust side) plus that id for debuggability. The console closure is created
+// once per session and must NOT be bound to the creating request's id —
+// doing so made the daemon drop every log line after the first call.
+function sessionConsole(sid) {
+  const emit = (type) => (...a) => {
+    const s = sessions.get(sid);
+    send({ id: s && s.currentId ? s.currentId : null, session: sid, type, data: a.map(fmt).join(" ") });
   };
+  return { log: emit("stdout"), info: emit("stdout"), warn: emit("stderr"), error: emit("stderr") };
 }
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -359,23 +427,38 @@ rl.on("line", (line) => {
   if (op === "destroy") { sessions.delete(session); send({ id, type: "done", result: null }); return; }
   if (op !== "exec") { send({ id, type: "error", error: "unknown op: " + op }); return; }
 
-  let ctx = sessions.get(session);
-  const createdSession = !ctx;
-  if (!ctx) {
-    ctx = vm.createContext({ console: makeConsole(id), require });
-    sessions.set(session, ctx);
+  let entry = sessions.get(session);
+  const createdSession = !entry;
+  if (!entry) {
+    // Timer/microtask globals are injected so session code can schedule work
+    // without `require("timers")` (host globals, same trust level as the
+    // already-injected `require` — the whole action is gated as shell).
+    entry = {
+      ctx: vm.createContext({
+        console: sessionConsole(session),
+        require,
+        setTimeout,
+        clearTimeout,
+        setInterval,
+        clearInterval,
+        queueMicrotask,
+      }),
+      currentId: null,
+    };
+    sessions.set(session, entry);
   }
+  entry.currentId = id;
   let value;
   try {
-    value = vm.runInContext(code, ctx, { timeout: VM_TIMEOUT_MS, displayErrors: true });
+    value = vm.runInContext(code, entry.ctx, { timeout: VM_TIMEOUT_MS, displayErrors: true });
   } catch (e) {
-    send({ id, type: "error", error: String((e && e.stack) || e), createdSession });
+    send({ id, session, type: "error", error: String((e && e.stack) || e), createdSession });
     return;
   }
   const cap = new Promise((_, rej) => setTimeout(() => rej(new Error("async result exceeded " + ASYNC_CAP_MS + "ms")), ASYNC_CAP_MS));
   Promise.race([Promise.resolve(value), cap]).then(
-    (v) => send({ id, type: "done", result: serialize(v), createdSession }),
-    (e) => send({ id, type: "error", error: String((e && e.stack) || e), createdSession }),
+    (v) => send({ id, session, type: "done", result: serialize(v), createdSession }),
+    (e) => send({ id, session, type: "error", error: String((e && e.stack) || e), createdSession }),
   );
 });
 rl.on("close", () => process.exit(0));
@@ -503,5 +586,135 @@ mod tests {
             .exec(EvalRequest { code: "1".into(), session: None })
             .await;
         assert!(matches!(res, Err(DaemonError::CapabilityDenied(_))));
+    }
+
+    /// Regression: the session's console closure outlives the request that
+    /// created it. Frames were tagged with THAT request's id, so the reader
+    /// (which routes by request id) discarded every log line from call 2 on —
+    /// stdout came back empty while the feature docs claimed "console
+    /// captured". Console frames now route by session.
+    #[tokio::test]
+    async fn console_on_later_session_calls_is_captured() {
+        if !have_runtime().await {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+        let engine = EvalEngine::new(gate_with(true));
+        let first = engine
+            .exec(EvalRequest {
+                code: "console.log('first call'); globalThis.counter = 1; 1".into(),
+                session: None,
+            })
+            .await
+            .unwrap();
+        assert!(first.created_session);
+        assert!(first.stdout.contains("first call"), "stdout={:?}", first.stdout);
+
+        let second = engine
+            .exec(EvalRequest {
+                code: "console.log('second call'); counter + 1".into(),
+                session: Some(first.session_id.clone()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.result, Some(serde_json::json!(2)));
+        assert!(
+            second.stdout.contains("second call"),
+            "log from the second call of a live session was dropped: stdout={:?}",
+            second.stdout
+        );
+
+        // stderr rides the same session-tagged routing.
+        let third = engine
+            .exec(EvalRequest {
+                code: "console.error('late stderr'); undefined".into(),
+                session: Some(first.session_id.clone()),
+            })
+            .await;
+        match third {
+            Ok(r) => assert!(r.stderr.contains("late stderr"), "stderr={:?}", r.stderr),
+            Err(DaemonError::EvalFailed { stderr, .. }) => {
+                assert!(stderr.contains("late stderr"), "stderr={:?}", stderr)
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
+
+    /// Fire-and-forget async output must reach the session that produced it,
+    /// even when it lands while ANOTHER session is executing (queued) or
+    /// while no exec is in flight (sits in the pipe, read on next call).
+    #[tokio::test]
+    async fn idle_or_cross_session_output_is_queued_not_stolen_or_lost() {
+        if !have_runtime().await {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+        let engine = EvalEngine::new(gate_with(true));
+        let a = engine
+            .exec(EvalRequest {
+                code: "(async () => { await new Promise(r => setTimeout(r, 50)); console.log('late from A'); })(); 'scheduled'"
+                    .into(),
+                session: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(a.result, Some(serde_json::json!("scheduled")));
+
+        // B executes while A's timer is (or has been) firing: the frame is
+        // tagged session=A and must not pollute B's stream.
+        let b = engine
+            .exec(EvalRequest { code: "'bee'".into(), session: None })
+            .await
+            .unwrap();
+        assert_eq!(b.result, Some(serde_json::json!("bee")));
+        assert!(
+            !b.stdout.contains("late from A"),
+            "another session's output leaked into this one: stdout={:?}",
+            b.stdout
+        );
+
+        // Let the timer fire for sure (it may already have, during B or idle).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let a2 = engine
+            .exec(EvalRequest {
+                code: "'again'".into(),
+                session: Some(a.session_id.clone()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(a2.result, Some(serde_json::json!("again")));
+        assert!(
+            a2.stdout.contains("late from A"),
+            "queued idle output never reached its session: stdout={:?}",
+            a2.stdout
+        );
+    }
+
+    /// Timer globals are part of the session context now (previously the
+    /// context only had console+require, so plain `setTimeout` was a
+    /// ReferenceError and even the runtime's own async patterns needed
+    /// require("timers")).
+    #[tokio::test]
+    async fn timer_globals_exist_in_the_session_context() {
+        if !have_runtime().await {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+        let engine = EvalEngine::new(gate_with(true));
+        let res = engine
+            .exec(EvalRequest {
+                code: "typeof setTimeout + '/' + typeof clearTimeout + '/' + typeof queueMicrotask"
+                    .into(),
+                session: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            res.result,
+            Some(serde_json::json!("function/function/function")),
+            "result={:?}",
+            res.result
+        );
     }
 }
