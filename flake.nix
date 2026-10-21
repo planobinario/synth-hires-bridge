@@ -39,7 +39,9 @@
       {
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "synth-hires-bridge";
-          version = "0.1.21";
+          # Single source of truth: the workspace version in Cargo.toml.
+          # A manual copy here drifts on every bump (deb=rust vs nix).
+          version = (builtins.fromTOML (builtins.readFile ./apps/desktop-daemon/Cargo.toml)).workspace.package.version;
           # Wrap the repo so the unpacked source gets a STABLE directory name
           # (`synthhires-bridge-source`): plain store-path srcs (src = ./.)
           # land under their hashed basename, which broke sourceRoot below.
@@ -54,8 +56,11 @@
 
           inherit nativeBuildInputs buildInputs;
 
-          # Tests require X11 display and IPC which aren't present in nix sandbox
-          doCheck = false;
+          # GUI/egui tests need X11/IPC, absent in the nix sandbox — but the
+          # protocol + core crates are headless and fast. Run exactly those
+          # (same gate as apps/desktop-daemon/AGENTS.md), not nothing.
+          doCheck = true;
+          cargoTestFlags = [ "-p" "daemon-protocol" "-p" "daemon-core" ];
 
           meta = with pkgs.lib; {
             description = "SynthHires Desktop Daemon — bridges the AI agent to your PC's filesystem and terminal";
@@ -88,16 +93,47 @@
               default = self.packages.${pkgs.system}.default;
               description = "The synthhires-bridge package to use.";
             };
+            # Headless by default: the module targets servers/VMs as well
+            # as desktops. GUI mode needs a display; set headless=false
+            # only inside a graphical session.
+            headless = lib.mkOption {
+              type = lib.types.bool;
+              default = true;
+              description = "Run with --headless (no egui window).";
+            };
+            backendUrl = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              example = "https://synthhires.com";
+              description = "Backend origin passed as --backend-url.";
+            };
+            configDir = lib.mkOption {
+              type = lib.types.nullOr lib.types.path;
+              default = null;
+              description = "State dir passed as --config-dir.";
+            };
+            localPort = lib.mkOption {
+              type = lib.types.nullOr lib.types.port;
+              default = null;
+              description = "Local HTTP port passed as --local-port.";
+            };
           };
 
           config = lib.mkIf cfg.enable {
             systemd.user.services.synthhires-bridge = {
               description = "SynthHires Bridge Daemon";
-              wantedBy = [ "graphical-session.target" ];
+              # default.target covers headless servers/VMs without a
+              # graphical session; graphical-session.target covers desktops.
+              wantedBy = [ "default.target" "graphical-session.target" ];
               partOf = [ "graphical-session.target" ];
               serviceConfig = {
-                ExecStart = "${cfg.package}/bin/synth-hires-bridge run";
-                Restart = "on-failure";
+                ExecStart = "${cfg.package}/bin/synth-hires-bridge"
+                  + lib.optionalString cfg.headless " --headless"
+                  + lib.optionalString (cfg.backendUrl != null) " --backend-url ${cfg.backendUrl}"
+                  + lib.optionalString (cfg.configDir != null) " --config-dir ${cfg.configDir}"
+                  + lib.optionalString (cfg.localPort != null) " --local-port ${toString cfg.localPort}"
+                  + " run";
+                Restart = "always";
                 RestartSec = "5s";
               };
             };

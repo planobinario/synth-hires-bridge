@@ -50,16 +50,20 @@ const OUT = arg("out");
 const CHECK = has("check");
 
 // target triple -> release asset filename (exactly one row per triple).
+// The universal macOS binary serves BOTH triples: it gets one manifest
+// entry PER triple (distinct keys, same bytes/url) because the verifier
+// matches on `entry.target`. Collapsing both triples into a single key
+// silently dropped x86_64 macs from auto-update (second write wins).
 const MANIFEST_ASSETS = [
   ["synthhires-bridge-linux-x64", "x86_64-unknown-linux-gnu"],
   ["synthhires-bridge-linux-arm64", "aarch64-unknown-linux-gnu"],
-  ["synthhires-bridge-macos", "x86_64-apple-darwin"],
-  ["synthhires-bridge-macos", "aarch64-apple-darwin"],
+  ["synthhires-bridge-macos", "x86_64-apple-darwin", "synthhires-bridge-macos-x64"],
+  ["synthhires-bridge-macos", "aarch64-apple-darwin", "synthhires-bridge-macos-arm64"],
   ["synthhires-bridge-windows-x64-user.exe", "x86_64-pc-windows-msvc"],
 ];
 
 const artifacts = {};
-for (const [asset, target] of MANIFEST_ASSETS) {
+for (const [asset, target, keyOverride] of MANIFEST_ASSETS) {
   const path = `${ASSETS}/${asset}`;
   if (!existsSync(path)) {
     console.warn(`[sign-manifest] skip ${target}: asset ${asset} not present`);
@@ -67,7 +71,7 @@ for (const [asset, target] of MANIFEST_ASSETS) {
   }
   const bytes = readFileSync(path);
   const sha256 = createHash("sha256").update(bytes).digest("hex");
-  const key = asset.replace(/\.[^.]+$/, "");
+  const key = keyOverride ?? asset.replace(/\.[^.]+$/, "");
   artifacts[key] = {
     sha256,
     target,

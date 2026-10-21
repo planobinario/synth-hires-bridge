@@ -10,7 +10,7 @@
 #          -v "${XDG_RUNTIME_DIR}/bus:${XDG_RUNTIME_DIR}/bus" \
 #          -e DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus" \
 #          -e SYNTHHIRES_BACKEND_URL=https://synthhires.com \
-#          ghcr.io/planobinario/synthhires-bridge:edge
+#          ghcr.io/planobinario/synthhires-bridge:edge --headless run
 #      then pair once: docker exec bridge synthhires-bridge pair <backend> <code>
 #
 #   B. Ephemeral runner: same image, no volumes; pair → run → unpair per job.
@@ -60,9 +60,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=fetch /tmp/synthhires-bridge /usr/local/bin/synthhires-bridge
 # HOME=/data: the daemon stores state.json + log under the user config dir,
 # so a single volume persists pairing across restarts on any feature set.
+# The named volume is initialised as root — chown it so the `bridge` user
+# (whatever uid it got above) can actually write state.json.
 ENV HOME=/data \
     SYNTHHIRES_BACKEND_URL=https://synthhires.com
 VOLUME /data
+RUN mkdir -p /data && chown bridge:bridge /data
 USER bridge
 WORKDIR /data
 ENTRYPOINT ["synthhires-bridge"]

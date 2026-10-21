@@ -18,6 +18,8 @@
 # Security note: `edge` is a rolling release with no signed manifest yet
 # (signed updates are tracked in the web repo's docs/bridge-design.md §8).
 # Downloads run over HTTPS from github.com; pin --tag for reproducible hosts.
+# Binary naming: Cargo builds `synth-hires-bridge` (with hyphen); releases,
+# install.sh and Docker rename it to `synthhires-bridge` (no hyphen).
 set -euo pipefail
 
 REPO="planobinario/synthhires-bridge"
@@ -103,8 +105,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=${TARGET} --backend-url ${BACKEND} run
-Restart=on-failure
+ExecStart=${TARGET} --headless --backend-url "${BACKEND}" run
+Restart=always
 RestartSec=5s
 
 [Install]
