@@ -67,8 +67,18 @@
           # three platforms that have a real TTY. What is left — 120
           # tests — is still a gate, which is the point: the build was
           # checking nothing at all before.
+          # `--lib` restricts the run to the UNIT tests of each crate.
+          # The integration tests (tests/*.rs) exercise the HOST — the
+          # process listing, the filesystem watch — and a build sandbox
+          # is not a host: `list_processes` has nothing to list there.
+          # Those tests belong to the CI, which runs on three real
+          # platforms.
+          #
+          # The PTY and process-group unit tests are skipped for the same
+          # reason: no pseudo-terminal, and process-group semantics the
+          # sandbox does not provide.
           cargoTestFlags = [
-            "-p" "daemon-protocol" "-p" "daemon-core"
+            "-p" "daemon-protocol" "-p" "daemon-core" "--lib"
             "--" "--skip" "pty_ops::tests"
             "--skip" "shell::tests::cancellation_kills_the_whole_process_group"
             "--skip" "shell::tests::timeout_reaps_the_whole_process_group"
