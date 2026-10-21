@@ -47,6 +47,12 @@ impl<'a> PairingFlow<'a> {
     }
 
     pub async fn complete(&self, mut req: PairCompleteRequest) -> Result<PairCompleteResponse> {
+        // Fail BEFORE touching the network: the code is single-use, so a
+        // POST to a malformed/attacker backend burns it AND exfiltrates
+        // code+pairing_id+fingerprint+device_name. Probe the keyring first
+        // for the same reason (no Secret Service = token unpersistable).
+        validate_backend_url(self.backend_url).map_err(crate::DaemonError::Protocol)?;
+        TokenStore::probe()?;
         // Keep CLI/deep-link pairing aligned with the web's default scope.
         // Existing callers can request a subset, but a Desktop client must
         // never silently omit a capability that this binary implements.
@@ -102,6 +108,54 @@ impl<'a> PairingFlow<'a> {
     }
 }
 
+/// Validates a backend origin BEFORE any pairing traffic touches it.
+/// Accepts `https://` / `wss://` anywhere, and `http://` / `ws://` ONLY for
+/// loopback (local dev: wrangler on 127.0.0.1, ws handoff URLs). Anything
+/// else (including `https://evil`, `file:`, bare hostnames, userinfo
+/// `https://user@host`) is rejected: pairing ships the single-use code plus
+/// fingerprint/device_name, so a redirected POST is both code-burn and
+/// exfiltration. Shared by CLI `pair`, the deep-link IPC handler and the
+/// local-HTTP `/pair` endpoint — one invariant, three entry points.
+pub fn validate_backend_url(backend: &str) -> std::result::Result<(), String> {
+    let b = backend.trim();
+    if b.is_empty() {
+        return Err("backend vacío".into());
+    }
+    let lower = b.to_ascii_lowercase();
+    // Scheme allowlist first (no userinfo smuggling: userinfo requires @
+    // before the host — reject any URL containing '@' before the first '/'
+    // after the scheme).
+    let (scheme, rest) = lower
+        .split_once("://")
+        .ok_or_else(|| format!("backend sin esquema válido: {b}"))?;
+    if !matches!(scheme, "https" | "wss" | "http" | "ws") {
+        return Err(format!("esquema no permitido en backend: {b}"));
+    }
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.is_empty() {
+        return Err(format!("backend sin host: {b}"));
+    }
+    if authority.contains('@') {
+        return Err(format!("backend con userinfo no permitido: {b}"));
+    }
+    // Strip port for the loopback check; reject malformed ports.
+    let host = authority.split(':').next().unwrap_or("");
+    if matches!(scheme, "http" | "ws") {
+        let loopback = host == "localhost"
+            || host == "127.0.0.1"
+            || host == "::1"
+            || host == "[::1]";
+        if !loopback {
+            return Err(format!("http/ws solo permitido en loopback: {b}"));
+        }
+    }
+    // Presencia de controles/espacios = rechazo (CLI splitting, log injection).
+    if b.chars().any(|c| c.is_control() || c == ' ') {
+        return Err(format!("backend con caracteres inválidos: {b}"));
+    }
+    Ok(())
+}
+
 /// Builds the WebSocket endpoint the WS client dials. Idempotent: the saved
 /// state may hold a plain origin (deep-link flow), a full http(s) URL that
 /// already contains the path, or an already-normalized ws(s) endpoint from
@@ -135,6 +189,29 @@ pub fn ws_endpoint_for_origin(backend_origin: &str, ws_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_url_validation() {
+        // Prod / staging: https + wss anywhere.
+        assert!(validate_backend_url("https://synthhires.com").is_ok());
+        assert!(validate_backend_url("https://staging.example.workers.dev/sub").is_ok());
+        assert!(validate_backend_url("wss://synthhires.com/api/devices/ws").is_ok());
+        // Local dev: http/ws SOLO loopback.
+        assert!(validate_backend_url("http://127.0.0.1:8788").is_ok());
+        assert!(validate_backend_url("http://localhost:4321").is_ok());
+        assert!(validate_backend_url("ws://127.0.0.1:8788/api/devices/ws").is_ok());
+        // Rechazos: sin esquema, esquemas raros, http no-loopback,
+        // userinfo, vacío, espacios.
+        assert!(validate_backend_url("").is_err());
+        assert!(validate_backend_url("synthhires.com").is_err());
+        assert!(validate_backend_url("file:///etc/passwd").is_err());
+        assert!(validate_backend_url("ftp://host/x").is_err());
+        assert!(validate_backend_url("http://192.168.1.10:8788").is_err());
+        assert!(validate_backend_url("http://evil.com").is_err());
+        assert!(validate_backend_url("ws://evil.com/ws").is_err());
+        assert!(validate_backend_url("https://user@synthhires.com").is_err());
+        assert!(validate_backend_url("https://synthhires.com/x y").is_err());
+    }
 
     #[test]
     fn ws_endpoint_converts_http_origins() {

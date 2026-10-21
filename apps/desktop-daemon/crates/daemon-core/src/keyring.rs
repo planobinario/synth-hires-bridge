@@ -48,6 +48,36 @@ impl TokenStore {
         }
     }
 
+    /// Pre-flight check BEFORE burning a single-use pairing code: writes,
+    /// reads back and deletes a sentinel entry. On headless hosts without
+    /// Secret Service (no dbus / gnome-keyring / KWallet) this fails HERE
+    /// with an actionable error instead of consuming the server code and
+    /// then failing to persist the real token (which forces the user to
+    /// regenerate the code and leaves a ghost device server-side).
+    pub fn probe() -> Result<()> {
+        let probe_account = "__synthhires_probe__";
+        let entry =
+            Entry::new(SERVICE, probe_account).map_err(|e| DaemonError::Keyring(e.to_string()))?;
+        let sentinel = uuid::Uuid::new_v4().to_string();
+        entry
+            .set_password(&sentinel)
+            .map_err(|e| {
+                DaemonError::Keyring(format!(
+                    "keyring unavailable (no Secret Service / dbus session?): {e}"
+                ))
+            })?;
+        let back = entry.get_password().map_err(|e| {
+            DaemonError::Keyring(format!("keyring read-back failed: {e}"))
+        })?;
+        let _ = entry.delete_password();
+        if back != sentinel {
+            return Err(DaemonError::Keyring(
+                "keyring read-back mismatch — refusing to pair".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn list_device_ids() -> Result<Vec<String>> {
         // `keyring` 2.x doesn't ship a portable "list all" across
         // platforms. The CLI uses a sidecar file at
