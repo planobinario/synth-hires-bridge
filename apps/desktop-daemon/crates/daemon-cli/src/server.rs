@@ -16,6 +16,9 @@ pub struct ServerState {
     pub daemon_state: Arc<RwLock<DaemonState>>,
     pub config_dir: std::path::PathBuf,
     pub _backend_url: String,
+    /// Port this server was bound to — used by the Host pinning guard
+    /// (check_host) so --local-port daemons don't accept Host: 127.0.0.1:7333.
+    pub local_port: u16,
     pub pairing_nonce: Arc<RwLock<Option<(String, std::time::Instant)>>>,
     pub status_tx: tokio::sync::watch::Sender<String>,
     pub last_poll: Arc<std::sync::atomic::AtomicU64>,
@@ -58,6 +61,9 @@ pub async fn start_http_server(
             *w = Some((uuid::Uuid::new_v4().to_string(), std::time::Instant::now()));
         }
     }
+
+    let mut state = state;
+    state.local_port = port;
 
     // CORS estricto con PNA (Private Network Access)
     let cors = CorsLayer::new()
@@ -111,11 +117,84 @@ fn check_origin(headers: &axum::http::HeaderMap) -> Result<(), (StatusCode, &'st
     Ok(())
 }
 
+/// DNS-rebinding guard: the server binds 127.0.0.1, but a rebinding
+/// domain (evil.com → 127.0.0.1) would still reach the socket. Browsers
+/// send the ATTACKER origin (rejected by check_origin), yet non-browser
+/// clients set any Origin they want — so additionally pin the Host to
+/// this machine's loopback + the configured port. Both checks must pass.
+fn check_host(
+    headers: &axum::http::HeaderMap,
+    port: u16,
+) -> Result<(), (StatusCode, &'static str)> {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    // Strip a single trailing-dot FQDN form and compare case-insensitively.
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let expected_ip = format!("127.0.0.1:{port}");
+    let expected_local = format!("localhost:{port}");
+    if host == expected_ip || host == expected_local {
+        return Ok(());
+    }
+    tracing::warn!("Rejecting request with unexpected Host: {}", host);
+    Err((StatusCode::FORBIDDEN, "Invalid Host"))
+}
+
+fn check_local(
+    headers: &axum::http::HeaderMap,
+    port: u16,
+) -> Result<(), (StatusCode, &'static str)> {
+    check_origin(headers)?;
+    check_host(headers, port)?;
+    Ok(())
+}
+
+/// Single-use local-action nonce (120 s TTL). Consumes on success —
+/// every mutating local endpoint (/pair, /unpair, /shutdown) takes one,
+/// so a second local process cannot replay a captured call and must win
+/// a live race against the legitimate client instead.
+async fn take_nonce(
+    state: &ServerState,
+    presented: &str,
+) -> Result<(), (StatusCode, &'static str)> {
+    let mut n = state.pairing_nonce.write().await;
+    let valid = match &*n {
+        Some((val, created_at)) => {
+            val == presented
+                && std::time::Instant::now().duration_since(*created_at)
+                    <= std::time::Duration::from_secs(120)
+        }
+        None => false,
+    };
+    if !valid {
+        tracing::warn!("Rejecting local request: invalid, expired, or missing nonce");
+        return Err((StatusCode::FORBIDDEN, "Invalid nonce"));
+    }
+    *n = None;
+    Ok(())
+}
+
+async fn mint_nonce(state: &ServerState) -> String {
+    let mut n = state.pairing_nonce.write().await;
+    let now = std::time::Instant::now();
+    if let Some((_, created_at)) = &*n {
+        if now.duration_since(*created_at) <= std::time::Duration::from_secs(120) {
+            if let Some((val, _)) = &*n {
+                return val.clone();
+            }
+        }
+    }
+    let fresh = uuid::Uuid::new_v4().to_string();
+    *n = Some((fresh.clone(), now));
+    fresh
+}
+
 async fn handle_status(
     headers: axum::http::HeaderMap,
     State(state): State<ServerState>,
 ) -> Result<Json<StatusResponse>, (StatusCode, &'static str)> {
-    check_origin(&headers)?;
+    check_local(&headers, state.local_port)?;
     // Registrar el poll del frontend para saber que la UI está abierta
     state.last_poll.store(
         std::time::SystemTime::now()
@@ -127,24 +206,11 @@ async fn handle_status(
 
     let is_paired = state.daemon_state.read().await.device_id.is_some();
 
-    // Si ya está emparejado, no exponemos nonce.
-    // Si no está emparejado, comprobamos el TTL del nonce. Si expira o no hay, creamos uno nuevo.
-    let nonce = if !is_paired {
-        let mut n = state.pairing_nonce.write().await;
-        let now = std::time::Instant::now();
-        if let Some((_, created_at)) = &*n {
-            if now.duration_since(*created_at) > std::time::Duration::from_secs(120) {
-                // Expired
-                *n = None;
-            }
-        }
-        if n.is_none() {
-            *n = Some((uuid::Uuid::new_v4().to_string(), now));
-        }
-        n.as_ref().map(|(val, _)| val.clone())
-    } else {
-        None
-    };
+    // El nonce es el amarre anti-replay de TODAS las acciones mutantes
+    // locales (/pair, /unpair, /shutdown): se emite siempre (emparejado
+    // o no), con TTL 120 s y consumo single-use. Sin él, cualquier
+    // proceso local podría desemparejar o apagar el daemon.
+    let nonce = Some(mint_nonce(&state).await);
 
     let device_id = state.daemon_state.read().await.device_id.clone();
 
@@ -160,11 +226,21 @@ async fn handle_status(
 
 /// Graceful shutdown: local endpoint so the web UI (or a CLI agent)
 /// can stop the daemon cleanly instead of killing the process.
+/// Requires a fresh single-use nonce (see /status): an unauthenticated
+/// local POST must never be able to kill the daemon.
+#[derive(Deserialize)]
+pub struct ShutdownRequest {
+    #[serde(default)]
+    pub nonce: String,
+}
+
 async fn handle_shutdown(
     headers: axum::http::HeaderMap,
-    State(_state): State<ServerState>,
+    State(state): State<ServerState>,
+    Json(payload): Json<ShutdownRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
-    check_origin(&headers)?;
+    check_local(&headers, state.local_port)?;
+    take_nonce(&state, &payload.nonce).await?;
     tracing::info!("Shutdown requested via local HTTP");
     // Give the response a moment to flush before the process exits.
     tokio::spawn(async {
@@ -181,29 +257,20 @@ async fn handle_pair(
     State(state): State<ServerState>,
     Json(payload): Json<PairRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
-    check_origin(&headers)?;
+    check_local(&headers, state.local_port)?;
     let is_paired = state.daemon_state.read().await.device_id.is_some();
     if is_paired {
         return Err((StatusCode::CONFLICT, "Already paired"));
     }
 
-    // Validar el Nonce
-    {
-        let mut n = state.pairing_nonce.write().await;
-        let valid = match &*n {
-            Some((val, created_at)) => {
-                val == &payload.nonce
-                    && std::time::Instant::now().duration_since(*created_at)
-                        <= std::time::Duration::from_secs(120)
-            }
-            None => false,
-        };
-        if !valid {
-            tracing::warn!("Rejecting /pair request: invalid, expired, or missing nonce");
-            return Err((StatusCode::FORBIDDEN, "Invalid nonce"));
-        }
-        // Consumir el nonce para que no se pueda reusar (previene replay attacks)
-        *n = None;
+    // Nonce single-use (previene replay attacks).
+    take_nonce(&state, &payload.nonce).await?;
+
+    // Validar el backend ANTES de persistir nada: un backend arbitrario
+    // aquí redirigiría el WS a un servidor atacante con el token real.
+    if let Err(e) = daemon_core::pairing::validate_backend_url(&payload.backend_url) {
+        tracing::warn!("Rejecting /pair: invalid backend_url: {e}");
+        return Err((StatusCode::BAD_REQUEST, "Invalid backend_url"));
     }
 
     tracing::info!("Valid pairing request received via local HTTP. Token handoff starting...");
@@ -269,11 +336,21 @@ async fn handle_pair(
 /// paired under a different account/session. Clears the keyring entry,
 /// state.json, and the WS client; the pairing nonce is regenerated so
 /// the browser can immediately POST /pair with its own device.
+/// Requires a fresh single-use nonce: without it, any local process
+/// could silently steal the device binding (unpair → pair-as-attacker).
+#[derive(Deserialize)]
+pub struct UnpairRequest {
+    #[serde(default)]
+    pub nonce: String,
+}
+
 async fn handle_unpair(
     headers: axum::http::HeaderMap,
     State(state): State<ServerState>,
+    Json(payload): Json<UnpairRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
-    check_origin(&headers)?;
+    check_local(&headers, state.local_port)?;
+    take_nonce(&state, &payload.nonce).await?;
 
     let device_id = {
         let s = state.daemon_state.read().await;
@@ -310,6 +387,8 @@ async fn handle_unpair(
 #[cfg(test)]
 mod tests {
     use super::is_allowed_origin;
+    use super::{check_host, check_local};
+    use axum::http::{header, HeaderMap};
 
     #[test]
     fn test_allowed_origin_production() {
@@ -362,5 +441,47 @@ mod tests {
         // HTTPS to localhost is not in the allow-list (no localhost cert).
         assert!(!is_allowed_origin("https://localhost:3000"));
         assert!(!is_allowed_origin("https://127.0.0.1:3000"));
+    }
+
+    fn headers_with(host: &str, origin: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, host.parse().unwrap());
+        h.insert(header::ORIGIN, origin.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn test_host_pinning_loopback_ok() {
+        let h = headers_with("127.0.0.1:7333", "https://synthhires.com");
+        assert!(check_host(&h, 7333).is_ok());
+        let h = headers_with("localhost:7333", "http://localhost:4321");
+        assert!(check_host(&h, 7333).is_ok());
+    }
+
+    #[test]
+    fn test_host_pinning_rejects_rebinding_and_wrong_port() {
+        // DNS-rebinding: attacker domain resolving to 127.0.0.1.
+        let h = headers_with("evil.example.com", "https://synthhires.com");
+        assert!(check_host(&h, 7333).is_err());
+        // Right host, wrong port (custom --local-port daemon).
+        let h = headers_with("127.0.0.1:9999", "https://synthhires.com");
+        assert!(check_host(&h, 7333).is_err());
+        // Missing Host entirely.
+        let mut h = HeaderMap::new();
+        h.insert(header::ORIGIN, "https://synthhires.com".parse().unwrap());
+        assert!(check_host(&h, 7333).is_err());
+    }
+
+    #[test]
+    fn test_check_local_requires_both() {
+        // Good origin + bad host → reject.
+        let h = headers_with("evil.example.com", "https://synthhires.com");
+        assert!(check_local(&h, 7333).is_err());
+        // Good host + bad origin → reject.
+        let h = headers_with("127.0.0.1:7333", "https://evil.example.com");
+        assert!(check_local(&h, 7333).is_err());
+        // Both good → pass.
+        let h = headers_with("127.0.0.1:7333", "https://synthhires.com");
+        assert!(check_local(&h, 7333).is_ok());
     }
 }

@@ -136,6 +136,20 @@ fn config_dir_of(cli: &Cli) -> PathBuf {
     cli.config_dir.clone().unwrap_or_else(default_config_dir)
 }
 
+/// Deep-link IPC socket path. Prefers `$XDG_RUNTIME_DIR` (per-user,
+/// per-session, mode 0700) over the world-sticky `/tmp`: shrinks the
+/// bind-squat window — where another local UID could grab the name
+/// between our `remove_file` and `bind` and capture `synthhires://pair`
+/// codes — down to the user's own runtime dir.
+fn ipc_socket_path() -> String {
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        if !dir.trim().is_empty() {
+            return format!("{}/synthhires-bridge-ipc.sock", dir.trim_end_matches('/'));
+        }
+    }
+    "/tmp/synthhires-bridge-ipc.sock".to_string()
+}
+
 const LOCAL_ORIGIN: &str = "http://localhost:4321";
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -170,6 +184,12 @@ impl DaemonState {
         tokio::fs::write(&path, raw)
             .await
             .map_err(DaemonError::Io)?;
+        // device_id + backend_url are pairing material: never world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await;
+        }
         Ok(())
     }
 }
@@ -443,7 +463,8 @@ async fn background_daemon_task(
                             .to_ns_name::<interprocess::local_socket::GenericNamespaced>()
                             .unwrap()
                     } else {
-                        "/tmp/synthhires-bridge-ipc.sock"
+                        ipc_socket_path()
+                            .as_str()
                             .to_fs_name::<interprocess::local_socket::GenericFilePath>()
                             .unwrap()
                     };
@@ -463,7 +484,8 @@ async fn background_daemon_task(
                             .to_ns_name::<interprocess::local_socket::GenericNamespaced>()
                             .unwrap()
                     } else {
-                        "/tmp/synthhires-bridge-ipc.sock"
+                        ipc_socket_path()
+                            .as_str()
                             .to_fs_name::<interprocess::local_socket::GenericFilePath>()
                             .unwrap()
                     };
@@ -481,7 +503,19 @@ async fn background_daemon_task(
         }
         Some(l)
     } else {
-        None
+        // Headless takes the same single-instance lock: two daemons would
+        // fight over the local port, the keyring slot and the IPC socket,
+        // with the loser serving half the traffic. Fail fast instead
+        // (flock releases on process death, so no stale-lock wedges).
+        let l = single_instance::SingleInstance::new("synthhires-bridge");
+        match &l {
+            Ok(instance) if !instance.is_single() => {
+                ceprintln!("another synthhires-bridge instance is already running — refusing a second headless daemon");
+                std::process::exit(1);
+            }
+            _ => {}
+        }
+        Some(l)
     };
 
     let state = Arc::new(RwLock::new(DaemonState::load(&config_dir).await?));
@@ -601,14 +635,15 @@ async fn background_daemon_task(
                     .to_ns_name::<interprocess::local_socket::GenericNamespaced>()
                     .unwrap()
             } else {
-                "/tmp/synthhires-bridge-ipc.sock"
+                ipc_socket_path()
+                    .as_str()
                     .to_fs_name::<interprocess::local_socket::GenericFilePath>()
                     .unwrap()
             };
 
             #[cfg(unix)]
             {
-                let _ = std::fs::remove_file("/tmp/synthhires-bridge-ipc.sock");
+                let _ = std::fs::remove_file(ipc_socket_path());
             }
 
             let mut options = ListenerOptions::new().name(name);
@@ -703,10 +738,16 @@ async fn background_daemon_task(
                                         })
                                     };
 
-                                    let code = parse_param("code").or_else(|| {
-                                        // Legacy links used `pair?token=...`
-                                        parse_param("token")
-                                    });
+                                    // Legacy `pair?token=...` links are REJECTED: they carried
+                                    // the single-use code under the wrong key and old code
+                                    // stored the whole query as the token (auth failed forever).
+                                    // Code-only is the contract; token links must re-pair from the web.
+                                    if parse_param("token").is_some() && parse_param("code").is_none() {
+                                        tracing::warn!("Legacy pair?token link rejected; re-pair from the web (code link)");
+                                        let _ = stream.write_all(b"NACK:legacy-token-link").await;
+                                        return;
+                                    }
+                                    let code = parse_param("code");
                                     let pairing_id = parse_param("pairing_id");
                                     let backend = parse_param("backend")
                                         .unwrap_or_else(|| backend_url_clone.clone());
@@ -892,6 +933,7 @@ async fn background_daemon_task(
             daemon_state: state.clone(),
             config_dir: config_dir.clone(),
             _backend_url: backend_url.clone(),
+            local_port,
             pairing_nonce: Arc::new(tokio::sync::RwLock::new(None)),
             status_tx: status_tx.clone(),
             last_poll: last_poll.clone(),
@@ -944,7 +986,11 @@ async fn run_ws_client(
 
     let token = TokenStore::load(&device_id)
         .map_err(|e| DaemonError::Keyring(format!("token load: {e}")))?
-        .ok_or_else(|| DaemonError::Keyring("token not found in keyring".into()))?;
+        .ok_or_else(|| {
+            DaemonError::Keyring(
+                "token not found in keyring — pair first (`synthhires-bridge pair <backend> <code>`); on headless Linux this also means no Secret Service session (set DBUS_SESSION_BUS_ADDRESS, see docs/install.md)".into(),
+            )
+        })?;
 
     let fp = DeviceFingerprint::collect().hash_hex();
 
@@ -1021,14 +1067,17 @@ fn url_decode(input: &str) -> String {
 
 fn run_cli_command(cmd: &Cmd, cli: &Cli) -> Result<()> {
     let config_dir = config_dir_of(cli);
+    // The daemon may listen on --local-port / SYNTHHIRES_LOCAL_PORT;
+    // status/doctor/stop must query THAT port, not a hardcoded 7333.
+    let local_port = cli.local_port.unwrap_or(7333);
     match cmd {
         Cmd::Run => {
             // Unreachable via run_cli_command: `run` falls through to
             // the daemon body in main(). Kept for match completeness.
             std::process::exit(0);
         }
-        Cmd::Status { json } => cmd_status(&config_dir, *json),
-        Cmd::Doctor { json } => cmd_doctor(&config_dir, *json),
+        Cmd::Status { json } => cmd_status(&config_dir, local_port, *json),
+        Cmd::Doctor { json } => cmd_doctor(&config_dir, local_port, *json),
         Cmd::Verify { path, json } => cmd_verify(path.clone(), *json),
         Cmd::Logs { lines } => cmd_logs(&config_dir, *lines),
         Cmd::Pair {
@@ -1042,7 +1091,7 @@ fn run_cli_command(cmd: &Cmd, cli: &Cli) -> Result<()> {
             pairing_id.clone(),
         ),
         Cmd::Unpair => cmd_unpair(&config_dir),
-        Cmd::Stop => cmd_stop(),
+        Cmd::Stop => cmd_stop(local_port),
     }
 }
 
@@ -1059,12 +1108,18 @@ fn read_state(config_dir: &std::path::Path) -> DaemonState {
 fn write_state(config_dir: &std::path::Path, state: &DaemonState) -> Result<()> {
     std::fs::create_dir_all(config_dir).ok();
     let raw = serde_json::to_vec_pretty(state).map_err(DaemonError::Json)?;
-    std::fs::write(config_dir.join("state.json"), raw).map_err(DaemonError::Io)?;
+    let path = config_dir.join("state.json");
+    std::fs::write(&path, raw).map_err(DaemonError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 
-fn local_http_get(path: &str) -> Option<serde_json::Value> {
-    let url = format!("http://127.0.0.1:7333{path}");
+fn local_http_get(port: u16, path: &str) -> Option<serde_json::Value> {
+    let url = format!("http://127.0.0.1:{port}{path}");
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -1077,9 +1132,9 @@ fn local_http_get(path: &str) -> Option<serde_json::Value> {
     res.json().ok()
 }
 
-fn cmd_status(config_dir: &std::path::Path, json: bool) -> Result<()> {
+fn cmd_status(config_dir: &std::path::Path, local_port: u16, json: bool) -> Result<()> {
     let state = read_state(config_dir);
-    let remote = local_http_get("/status");
+    let remote = local_http_get(local_port, "/status");
     let keyring_ok = match &state.device_id {
         Some(id) => TokenStore::load(id).map(|t| t.is_some()).unwrap_or(false),
         None => false,
@@ -1142,10 +1197,10 @@ fn cmd_status(config_dir: &std::path::Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_doctor(config_dir: &std::path::Path, json: bool) -> Result<()> {
+fn cmd_doctor(config_dir: &std::path::Path, local_port: u16, json: bool) -> Result<()> {
     let state_path = config_dir.join("state.json");
     let state = read_state(config_dir);
-    let remote = local_http_get("/status");
+    let remote = local_http_get(local_port, "/status");
 
     let mut checks: Vec<(String, bool, String)> = Vec::new();
     checks.push((
@@ -1154,9 +1209,9 @@ fn cmd_doctor(config_dir: &std::path::Path, json: bool) -> Result<()> {
         state_path.display().to_string(),
     ));
     checks.push((
-        "daemon HTTP (7333) reachable".into(),
+        format!("daemon HTTP ({local_port}) reachable"),
         remote.is_some(),
-        "http://127.0.0.1:7333/status".into(),
+        format!("http://127.0.0.1:{local_port}/status"),
     ));
     let keyring_ok = match &state.device_id {
         Some(id) => TokenStore::load(id).map(|t| t.is_some()).unwrap_or(false),
@@ -1289,6 +1344,18 @@ fn cmd_pair(
         .build()
         .map_err(|e| DaemonError::Io(std::io::Error::other(e.to_string())))?;
     rt.block_on(async {
+        // Fail fast BEFORE burning the single-use code: an attacker or
+        // typo'd backend would consume the code and exfiltrate the
+        // fingerprint; a missing keyring would strand the token.
+        if let Err(e) = daemon_core::pairing::validate_backend_url(&backend) {
+            ceprintln!("invalid backend: {e}");
+            std::process::exit(2);
+        }
+        if let Err(e) = TokenStore::probe() {
+            ceprintln!("keyring unavailable — pairing would strand the token: {e}");
+            ceprintln!("hint: Linux headless needs a Secret Service (gnome-keyring/KWallet) with DBUS_SESSION_BUS_ADDRESS set; see docs/install.md (Docker).");
+            std::process::exit(2);
+        }
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -1343,14 +1410,29 @@ fn cmd_unpair(config_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_stop() -> Result<()> {
+fn cmd_stop(local_port: u16) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| DaemonError::Protocol(format!("reqwest client: {e}")))?;
-    let res = client
-        .post("http://127.0.0.1:7333/shutdown")
+    // /shutdown requires a fresh single-use nonce (same guard as the web
+    // uses): fetch /status first, then present its nonce.
+    let status: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{local_port}/status"))
         .header("Origin", LOCAL_ORIGIN)
+        .send()
+        .map_err(|e| DaemonError::Protocol(format!("stop status: {e}")))?
+        .json()
+        .map_err(|e| DaemonError::Protocol(format!("stop status decode: {e}")))?;
+    let nonce = status
+        .get("nonce")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let res = client
+        .post(format!("http://127.0.0.1:{local_port}/shutdown"))
+        .header("Origin", LOCAL_ORIGIN)
+        .json(&serde_json::json!({ "nonce": nonce }))
         .send()
         .map_err(|e| DaemonError::Protocol(format!("stop request: {e}")))?;
     if res.status().is_success() {
