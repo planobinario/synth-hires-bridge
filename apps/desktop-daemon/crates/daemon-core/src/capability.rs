@@ -168,6 +168,15 @@ impl CapabilityGate {
         if !self.allows(capability) {
             return GateDecision::Deny;
         }
+        // Traversal (..): DENY duro aquí (no delegable a path_matches_any,
+        // que solo distingue Allow/RequireConsent). Ningún diálogo puede
+        // legitimar un escape de ámbito.
+        if path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+        {
+            return GateDecision::Deny;
+        }
         // One-shot owner consent covers the exact approved path (lexical
         // check here; the real-resolution guard in check_path_real also
         // honours it — see one_shot_paths docs for the threat model).
@@ -181,7 +190,11 @@ impl CapabilityGate {
     }
 
     fn path_matches_any(&self, path: &Path) -> bool {
-        // Defensa 1: Bloquear traversal (..)
+        // Defensa 1: traversal (..) es DENY duro, no consentimiento. Un
+        // `..` léxico nunca es una ruta legítima de trabajo (los clientes
+        // envían absolutas normalizadas); preguntar al usuario por un
+        // escape es erróneo, y con skip_consent_prompt ni siquiera habría
+        // diálogo. El test denies_path_traversal fija este invariante.
         if path.components().any(|c| matches!(c, Component::ParentDir)) {
             return false;
         }
@@ -314,13 +327,15 @@ mod tests {
 
     #[test]
     fn denies_path_traversal() {
+        // `..` es DENY duro (no consentimiento): ningún diálogo legitima
+        // un escape de ámbito, y con skip_consent_prompt ni habría diálogo.
         let g = gate_with_paths(&["/home/u/workspace"]);
         assert_eq!(
             g.check_path(
                 "desktop.fs.read",
                 Path::new("/home/u/workspace/../etc/passwd")
             ),
-            GateDecision::RequireConsent
+            GateDecision::Deny
         );
     }
 
@@ -372,7 +387,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
     }
-}
 
     // ── Case sensitivity ──────────────────────────────────────────────────
     //
@@ -472,3 +486,4 @@ mod tests {
             assert!(!paths_equal(spelled, approved));
         }
     }
+}
